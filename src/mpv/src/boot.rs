@@ -160,6 +160,11 @@ fn apply_defaults(
     set("force-window", "yes")?;
     set("idle", "yes")?;
 
+    // On macOS, auto-detection cannot identify Apple's dual-mode EDR display,
+    // so libplacebo never requests an HDR swapchain without this hint.
+    #[cfg(target_os = "macos")]
+    set("target-colorspace-hint", "yes")?;
+
     Ok(())
 }
 
