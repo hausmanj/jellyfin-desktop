@@ -415,7 +415,7 @@
         init() {
             return Promise.resolve({
                 deviceName: jmpInfo.deviceName,
-                appName: 'Jellyfin Desktop',
+                appName: 'Hausflix Desktop',
                 appVersion: jmpInfo.version
             });
         },
@@ -433,7 +433,7 @@
         },
         getDeviceProfile,
         getSyncProfile: getDeviceProfile,
-        appName() { return 'Jellyfin Desktop'; },
+        appName() { return 'Hausflix Desktop'; },
         appVersion() { return jmpInfo.version; },
         deviceName() { return jmpInfo.deviceName; },
         exit() { window.api.system.exit(); }

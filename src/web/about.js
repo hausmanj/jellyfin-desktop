@@ -47,7 +47,7 @@
     var logo = document.createElement('img');
     logo.className = 'logo';
     logo.src = 'logo.png';
-    logo.alt = 'Jellyfin';
+    logo.alt = 'Hausflix';
     var xBtn = document.createElement('div');
     xBtn.className = 'x';
     xBtn.textContent = '\u00D7';
