@@ -13,7 +13,7 @@ const ENV_CACHE_DIR: &str = "JELLYFIN_DESKTOP_CACHE_DIR";
 #[cfg(test)]
 const ENV_BACKED: &[&str] = &[ENV_LOG_LEVEL, ENV_LOG_FILE, ENV_CONFIG_DIR, ENV_CACHE_DIR];
 
-/// jellyfin-desktop — Jellyfin native desktop client.
+/// jellyfin-desktop — Hausflix Desktop native desktop client.
 ///
 /// The four path/logging options also read a `JELLYFIN_DESKTOP_*` environment
 /// variable; an explicit flag always wins over the variable. Each option is
