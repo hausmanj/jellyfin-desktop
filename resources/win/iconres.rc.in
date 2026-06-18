@@ -1,6 +1,6 @@
 #include <winver.h>
 
-IDI_ICON1 ICON "@CMAKE_SOURCE_DIR@/resources/win/jellyfin.ico"
+IDI_ICON1 ICON "@CMAKE_SOURCE_DIR@/resources/win/hausflix.ico"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     @APP_VERSION_MAJOR@,@APP_VERSION_MINOR@,@APP_VERSION_PATCH@,0
@@ -15,12 +15,12 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName",      "Jellyfin"
-            VALUE "FileDescription",  "Jellyfin Desktop"
+            VALUE "CompanyName",      "Hausflix"
+            VALUE "FileDescription",  "Hausflix Desktop"
             VALUE "FileVersion",      "@APP_VERSION_FULL@"
             VALUE "InternalName",     "jellyfin-desktop"
             VALUE "OriginalFilename", "jellyfin-desktop.exe"
-            VALUE "ProductName",      "Jellyfin Desktop"
+            VALUE "ProductName",      "Hausflix Desktop"
             VALUE "ProductVersion",   "@APP_VERSION_FULL@"
         END
     END

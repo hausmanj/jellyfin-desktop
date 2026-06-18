@@ -113,7 +113,7 @@
         settingsDescriptions: {
             playback: [
                 { key: 'hwdec', displayName: 'Hardware Decoding', help: 'Hardware video decoding mode. Use "auto" for automatic detection or "no" to disable.', options: _savedSettings.hwdecOptions },
-                { key: 'startupWindowMode', displayName: 'Startup Window Mode', help: 'Controls how the Jellyfin Desktop window opens on startup.', options: (() => {
+                { key: 'startupWindowMode', displayName: 'Startup Window Mode', help: 'Controls how the Hausflix Desktop window opens on startup.', options: (() => {
                     const options = [
                         { value: 'windowed', title: 'Open windowed' },
                         { value: 'maximized', title: 'Open maximized' },
