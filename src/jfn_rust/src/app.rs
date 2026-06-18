@@ -7,7 +7,9 @@ use std::sync::OnceLock;
 
 use clap::Parser;
 use jfn_cef::{APP_CEF_VERSION, APP_VERSION_FULL};
-use jfn_platform_abi::{IdleInhibitLevel, LogicalSize, Platform, Scale, WindowGeometry};
+use jfn_platform_abi::{
+    BootGeometry, IdleInhibitLevel, LogicalSize, Platform, Scale, WindowGeometry,
+};
 
 use crate::cli;
 
@@ -445,6 +447,7 @@ fn sync_cef_window_metrics(
     mpv_raw: *mut jfn_mpv::sys::mpv_handle,
     mut mw: c_int,
     mut mh: c_int,
+    boot: &BootGeometry,
 ) -> CefWindowMetrics {
     let mut display_hidpi_scale: f64 = 0.0;
     unsafe {
@@ -470,6 +473,17 @@ fn sync_cef_window_metrics(
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
     tracing::info!(target: "Main",
         "[FLOW] display-hidpi-scale={display_hidpi_scale} fullscreen={fs_flag} display-hz={hz}");
+
+    let min_physical = LogicalSize { w: 320, h: 180 }.to_physical(boot.scale);
+    if mw < min_physical.w || mh < min_physical.h {
+        mw = boot.physical.w;
+        mh = boot.physical.h;
+        let geom_str = format!("{mw}x{mh}");
+        tracing::warn!(target: "Main",
+            "[FLOW] rejecting placeholder startup size; resize to {geom_str}");
+        let g_c = cs(&geom_str);
+        unsafe { jfn_mpv::api::jfn_mpv_set_geometry(g_c.as_ptr()) };
+    }
 
     let saved = jfn_config::window_geometry();
     let locked = fs_flag != 0 || jfn_playback::ingest_driver::jfn_playback_window_maximized();
@@ -658,7 +672,7 @@ pub fn jfn_app_main() -> c_int {
         disable_gpu_compositing: opts.disable_gpu_compositing,
         remote_debugging_port: opts.remote_debugging_port,
     };
-    let rc = unsafe { run_with_cef(&boot_args, mw, mh) };
+    let rc = unsafe { run_with_cef(&boot_args, mw, mh, &boot) };
     if rc != 0 {
         return rc;
     }
@@ -823,7 +837,7 @@ fn h_shutdown_wake_manager() {
 }
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
-unsafe fn run_with_cef(ba: &BootArgs, mw: c_int, mh: c_int) -> c_int {
+unsafe fn run_with_cef(ba: &BootArgs, mw: c_int, mh: c_int, boot: &BootGeometry) -> c_int {
     // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
     let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
@@ -850,7 +864,7 @@ unsafe fn run_with_cef(ba: &BootArgs, mw: c_int, mh: c_int) -> c_int {
         return 1;
     }
 
-    let metrics = sync_cef_window_metrics(mpv_raw, mw, mh);
+    let metrics = sync_cef_window_metrics(mpv_raw, mw, mh, &boot);
 
     let (manager_thread, main_layer) = init_main_browser(
         metrics.lw,

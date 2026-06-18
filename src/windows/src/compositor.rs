@@ -564,17 +564,88 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     true
 }
 
-/// Software fallback: Windows is shared-textures-only in practice.
-/// No-op to match prior overlay/about behavior.
 pub fn win_surface_present_software(
-    _s: *mut c_void,
+    s: *mut c_void,
     _dirty: *const JfnRect,
     _dirty_len: usize,
-    _buffer: *const c_void,
-    _w: c_int,
-    _h: c_int,
+    buffer: *const c_void,
+    w: c_int,
+    h: c_int,
 ) -> bool {
-    false
+    if s.is_null() || buffer.is_null() || w <= 0 || h <= 0 {
+        return false;
+    }
+
+    let mut st = STATE.lock();
+    let p = s as *mut Surface;
+    if st.surfaces.is_main(p) {
+        match st.gate.main_present_decision((w, h)) {
+            PresentDecision::Reject => return false,
+            PresentDecision::EndTransitionThenPresent | PresentDecision::Present => {}
+        }
+    }
+    let devices = match st.devices.as_ref() {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w as u32,
+        Height: h as u32,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        ..Default::default()
+    };
+    let init = D3D11_SUBRESOURCE_DATA {
+        pSysMem: buffer,
+        SysMemPitch: w as u32 * 4,
+        SysMemSlicePitch: 0,
+    };
+    let mut src: Option<ID3D11Texture2D> = None;
+    unsafe {
+        if devices
+            .d3d_device
+            .CreateTexture2D(&desc, Some(&init), Some(&mut src))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let src = match src {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let surf = unsafe { &mut *p };
+    if !surf.visible {
+        return false;
+    }
+    let visual = match surf.visual.as_ref() {
+        Some(v) => v.clone(),
+        None => return false,
+    };
+    ensure_swap_chain(
+        devices,
+        &mut surf.swap_chain,
+        &mut surf.sw,
+        &mut surf.sh,
+        &visual,
+        w,
+        h,
+    );
+    let sc = match surf.swap_chain.as_ref() {
+        Some(sc) => sc.clone(),
+        None => return false,
+    };
+    present_to_swap_chain(devices, &sc, &src);
+    true
 }
 
 pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
