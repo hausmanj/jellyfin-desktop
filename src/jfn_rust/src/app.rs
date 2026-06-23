@@ -874,7 +874,7 @@ unsafe fn run_with_cef(ba: &BootArgs, mw: c_int, mh: c_int, boot: &BootGeometry)
         return 1;
     }
 
-    let metrics = sync_cef_window_metrics(mpv_raw, mw, mh, &boot);
+    let metrics = sync_cef_window_metrics(mpv_raw, mw, mh, boot);
 
     let (manager_thread, main_layer) = init_main_browser(
         metrics.lw,
