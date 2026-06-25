@@ -1,5 +1,8 @@
 //! Hwdec mode policy: which mpv hardware-decode backends each OS offers.
 
+#[cfg(target_os = "linux")]
+pub const HWDEC_DEFAULT: &str = "vaapi-copy";
+#[cfg(not(target_os = "linux"))]
 pub const HWDEC_DEFAULT: &str = "no";
 
 #[expect(
@@ -21,7 +24,7 @@ const CURRENT_OS: TargetOs = TargetOs::Macos;
 
 pub fn hwdec_options() -> &'static [&'static str] {
     match CURRENT_OS {
-        TargetOs::Linux => &["auto", "no", "vaapi", "nvdec", "vulkan"],
+        TargetOs::Linux => &["auto", "no", "vaapi", "vaapi-copy", "nvdec", "vulkan"],
         TargetOs::Windows => &["auto", "no", "d3d11va", "nvdec", "vulkan"],
         TargetOs::Macos => &["auto", "no", "videotoolbox", "vulkan"],
     }
