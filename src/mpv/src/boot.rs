@@ -152,10 +152,11 @@ fn load_bundled_scripts(handle: &Handle) -> crate::error::Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    // mpv's --script option accepts a colon-separated path list on Unix.
+    // "scripts" is the libmpv API name; "script" is a CLI-only alias that
+    // returns MPV_ERROR_OPTION_NOT_FOUND when set via mpv_set_option_string.
     let joined = paths.join(":");
     tracing::info!(target: "mpv", "loading bundled scripts: {joined}");
-    set_option_or_skip(handle, "script", &joined)
+    set_option_or_skip(handle, "scripts", &joined)
 }
 
 fn apply_defaults(
