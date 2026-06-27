@@ -177,6 +177,7 @@ fn apply_defaults(
     if display == DisplayBackend::Wayland {
         set("clipboard-backends", "")?;
         set("gpu-context", "wayland")?;
+        set("vo", "gpu-next")?;
     }
 
     // Window behavior.
