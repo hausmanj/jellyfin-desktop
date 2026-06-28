@@ -9,5 +9,4 @@ end
 
 mp.register_event("file-loaded", function()
     mp.set_property("target-colorspace-hint", "yes")
-    mp.msg.info("linux-hdr-hint: target-colorspace-hint=yes")
 end)
