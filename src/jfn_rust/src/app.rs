@@ -883,6 +883,10 @@ unsafe fn run_with_cef(ba: &BootArgs, mw: c_int, mh: c_int) -> c_int {
     if plat().cef_host().is_none() {
         unsafe { jfn_cef::client::jfn_cef_layer_wait_for_load(main_layer) };
     }
+    // Release the mpv VO gate now that CEF has painted its first frame, so
+    // vo=gpu-next's libplacebo startup frames are hidden behind the UI.
+    #[cfg(target_os = "linux")]
+    jfn_wlproxy::jfn_wlproxy_ungate_mpv_vo();
     tracing::info!(target: "Main", "Main browser loaded");
 
     tracing::info!(target: "Main", "[FLOW] Running — about to enter run_main_loop");

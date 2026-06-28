@@ -129,6 +129,7 @@ enum HostCommand {
     HidePopup,
     SetBackground,
     SetTitlebarPalette,
+    UngateMpvVo,
 }
 
 static COMMANDS: Mutex<VecDeque<HostCommand>> = Mutex::new(VecDeque::new());
@@ -289,6 +290,11 @@ struct Shell {
     mpv_toplevel: Option<Rc<XdgToplevel>>,
     mpv_subsurface: Option<Rc<WlSubsurface>>,
     demote_pending: bool,
+    // mpv's VO init (EGL setup) is gated until the host signals CEF is ready.
+    // Without a configure, mpv's subsurface stays bufferless and invisible, so
+    // vo=gpu-next's libplacebo startup flicker is hidden behind CEF's first frame.
+    vo_gated: bool,
+    pending_configure: Option<(i32, i32, Vec<u8>)>,
     host_adopted: bool,
     host_surface: Option<Rc<WlSurface>>,
     host_subsurface: Option<Rc<WlSubsurface>>,
@@ -330,6 +336,8 @@ impl Shell {
             mpv_toplevel: None,
             mpv_subsurface: None,
             demote_pending: false,
+            vo_gated: true,
+            pending_configure: None,
             host_adopted: false,
             host_surface: None,
             host_subsurface: None,
@@ -553,6 +561,13 @@ pub fn jfn_wlproxy_hide_popup() {
     COMMANDS.lock().push_back(HostCommand::HidePopup);
 }
 
+/// Release the mpv VO gate: sends the buffered xdg_toplevel.configure to mpv,
+/// triggering EGL/libplacebo initialization. Call once after CEF's main page
+/// has loaded so the VO startup frames are hidden behind CEF's first paint.
+pub fn jfn_wlproxy_ungate_mpv_vo() {
+    COMMANDS.lock().push_back(HostCommand::UngateMpvVo);
+}
+
 /// Queue an xdg_toplevel.set_fullscreen / unset_fullscreen request. Applied
 /// from the proxy's per-client thread on its next dispatch iteration.
 pub extern "C" fn jfn_wlproxy_set_fullscreen(enable: c_int) {
@@ -719,6 +734,15 @@ fn drain_host_commands() {
             HostCommand::HidePopup => destroy_popup(),
             HostCommand::SetBackground => refill_root_background(),
             HostCommand::SetTitlebarPalette => apply_titlebar_palette(),
+            HostCommand::UngateMpvVo => {
+                let pending = with_shell(|sh| {
+                    sh.vo_gated = false;
+                    sh.pending_configure.take()
+                });
+                if let Some((w, h, states)) = pending {
+                    synth_mpv_configure(w, h, &states);
+                }
+            }
         }
     }
 }
@@ -1081,13 +1105,9 @@ impl XdgSurfaceHandler for MpvSurfaceH {
                 VO_CONNECTION_INDEX.store(idx as i32, Ordering::Release);
             }
         });
-        // Hand mpv an immediate initial configure so its geometry is non-zero
-        // before it sizes its viewports. Building the real root + its compositor
-        // configure is async (registry roundtrip), and mpv's preferred_scale /
-        // viewport sizing fires first — a 0 geometry there yields an invalid
-        // wp_viewport.set_destination(0,0). The root configure refreshes this.
-        let (w, h) = with_shell(|sh| (sh.cur_w, sh.cur_h));
-        synth_mpv_configure(w, h, &[]);
+        // No configure sent here: mpv's VO is gated until jfn_wlproxy_ungate_mpv_vo()
+        // fires (after CEF's main page loads). Any 0x0 viewport requests mpv issues
+        // before configure are dropped by ClientViewportH.
         ensure_root();
     }
 }
@@ -1491,7 +1511,17 @@ impl XdgSurfaceHandler for RootXdgSurfaceH {
             hs.send_commit();
         }
 
-        synth_mpv_configure(w, h, &states);
+        let gated = with_shell(|sh| {
+            if sh.vo_gated {
+                sh.pending_configure = Some((w, h, states.clone()));
+                true
+            } else {
+                false
+            }
+        });
+        if !gated {
+            synth_mpv_configure(w, h, &states);
+        }
     }
 }
 
