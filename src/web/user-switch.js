@@ -1,7 +1,11 @@
 (function() {
+    console.warn('[JFD] user-switch.js loaded, hash=' + window.location.hash);
     const STORE_KEY = 'jellyfin_desktop_user_profiles_v1';
     const CREDENTIALS_KEY = 'jellyfin_credentials';
     const STARTUP_GUARD_KEY = 'jfdStartupPickerShown';
+    // Saved before addUser() clears credentials; restored on cancel.
+    const ADD_USER_SAVED_CREDS_KEY = 'jfdPreAddUserCreds';
+    const ADD_USER_SAVED_HASH_KEY  = 'jfdPreAddUserHash';
 
     // Class names that are structural to a menu-row icon span. Anything else on
     // a cloned icon span is the source row's glyph and must be stripped so our
@@ -84,6 +88,9 @@
         if (!server) return null;
 
         const user = userFromStorage(server);
+        // Skip if we don't have a real display name — the fallback
+        // "User XXXXXXXX" creates phantom entries that require re-login.
+        if (!user?.Name && !server?.UserName) return null;
         const store = readStore();
         const serverId = server.Id;
         const userId = server.UserId;
@@ -186,6 +193,11 @@
         };
 
         captureCurrentProfile();
+        // Save credentials and current hash so cancel can restore both.
+        try {
+            sessionStorage.setItem(ADD_USER_SAVED_CREDS_KEY, JSON.stringify(readCredentials()));
+            sessionStorage.setItem(ADD_USER_SAVED_HASH_KEY, window.location.hash || '');
+        } catch (err) { /* ignore */ }
         if (credentials && Array.isArray(credentials.Servers)) {
             delete server.AccessToken;
             delete server.UserId;
@@ -194,8 +206,8 @@
         }
         try { sessionStorage.setItem(STARTUP_GUARD_KEY, '1'); } catch (err) { /* ignore */ }
         removePicker();
-        // Hash-only navigation keeps the same document alive, avoiding the CEF
-        // focus reset that a full href reload causes on Windows OSR.
+        // Hash-only navigation keeps the SPA document alive so cancel can
+        // restore credentials and call showPicker() without a full reload.
         window.location.hash = '!/login.html';
         return true;
     }
@@ -453,12 +465,26 @@
         showPicker();
     }
 
+    function isPreferencesPage() {
+        const hash = (window.location.hash || '').toLowerCase();
+        return hash.includes('mypreferencesmenu') || hash.includes('mypreferences');
+    }
+
     function installMenuItem() {
-        if (document.getElementById('jfdSelectUserSettingsItem')) return true;
+        if (!isPreferencesPage()) return false;
+
+        const existing = document.getElementById('jfdSelectUserSettingsItem');
+        if (existing) {
+            console.warn('[JFD] installMenuItem: row exists, parentNode=' +
+                (existing.parentNode ? existing.parentNode.tagName + '.' + existing.parentNode.className.slice(0,40) : 'DETACHED'));
+            return true;
+        }
 
         const signOut = findRowByLabel('Sign Out');
         const selectServer = findRowByLabel('Select Server');
         const exitApplication = findRowByLabel('Exit Application');
+        console.warn('[JFD] installMenuItem: signOut=' + !!signOut +
+            ' selectServer=' + !!selectServer + ' exitApp=' + !!exitApplication);
         const reference = signOut || selectServer || exitApplication;
         if (!reference || !reference.parentNode) return false;
 
@@ -496,6 +522,64 @@
         } else {
             reference.parentNode.insertBefore(row, reference);
         }
+
+        // Walk ancestors to find and fix the element clipping our extra row.
+        // We look for overflow:hidden OR a max-height constraint — both can
+        // clip content. Log the full chain so we can see what's constraining.
+        let fixedEl = null;
+        let depth = 0;
+        let el = row.parentNode;
+        while (el && el !== document.body) {
+            const cs = window.getComputedStyle(el);
+            const hasOverflowHidden = cs.overflow === 'hidden' || cs.overflowY === 'hidden';
+            const hasMaxHeight = cs.maxHeight !== 'none' && cs.maxHeight !== '' && cs.maxHeight !== '0px';
+            console.warn('[JFD] ancestor[' + depth + '] <' + el.tagName + '> class="' +
+                el.className.slice(0, 50) + '" overflow=' + cs.overflow +
+                ' overflowY=' + cs.overflowY + ' height=' + cs.height + ' maxHeight=' + cs.maxHeight);
+            if (hasOverflowHidden || hasMaxHeight) {
+                el.classList.add('jfd-settings-overflow-fix');
+                console.warn('[JFD] → tagged ancestor[' + depth + '] with jfd-settings-overflow-fix' +
+                    (hasOverflowHidden ? ' (overflow:hidden)' : '') +
+                    (hasMaxHeight ? ' (maxHeight=' + cs.maxHeight + ')' : ''));
+                fixedEl = el;
+                // Watch for the class being stripped back off.
+                new MutationObserver(() => {
+                    if (!el.classList.contains('jfd-settings-overflow-fix')) {
+                        console.warn('[JFD] WARNING: jfd-settings-overflow-fix removed from ancestor[' + depth + '] — re-adding');
+                        el.classList.add('jfd-settings-overflow-fix');
+                    }
+                }).observe(el, { attributes: true, attributeFilter: ['class'] });
+                break;
+            }
+            el = el.parentNode;
+            depth++;
+        }
+        if (!fixedEl) {
+            console.warn('[JFD] WARNING: no clipping ancestor found after ' + depth + ' levels');
+        }
+
+        // Watch for our row or any sibling being removed from the parent.
+        const parent = row.parentNode;
+        const siblingsBefore = Array.from(parent.children).map(c =>
+            (c.id || '') + ':' + c.className.slice(0,20));
+        console.warn('[JFD] siblings at insertion: [' + siblingsBefore.join(', ') + ']');
+        new MutationObserver((muts) => {
+            for (const m of muts) {
+                for (const n of m.removedNodes) {
+                    if (n.nodeType === 1) {
+                        console.warn('[JFD] REMOVED from parent: id=' + n.id +
+                            ' class=' + n.className.slice(0,30));
+                    }
+                }
+                for (const n of m.addedNodes) {
+                    if (n.nodeType === 1) {
+                        console.warn('[JFD] ADDED to parent: id=' + n.id +
+                            ' class=' + n.className.slice(0,30));
+                    }
+                }
+            }
+        }).observe(parent, { childList: true });
+
         return true;
     }
 
@@ -513,9 +597,121 @@
     window.addEventListener('focus', captureCurrentProfile);
     window.addEventListener('storage', captureCurrentProfile);
 
+    function isLoginPage() {
+        const h = (window.location.hash || '').toLowerCase();
+        const p = (window.location.pathname || '').toLowerCase();
+        return h.includes('login') || p === '/login' || p.endsWith('/login');
+    }
+
+    // Inject a "Back to user selection" button directly below the Sign In
+    // button so it appears as a natural part of the login form's action area.
+    function injectLoginCancelButton() {
+        if (!isLoginPage()) return;
+        if (document.getElementById('jfdLoginCancelBtn')) return;
+        if (allProfiles().length < 1) return;
+
+        // Only show cancel if we actually came from addUser() (saved state exists).
+        let hasSavedState = false;
+        try { hasSavedState = !!sessionStorage.getItem(ADD_USER_SAVED_CREDS_KEY); } catch (err) {}
+        if (!hasSavedState) return;
+
+        // The Sign In button is the anchor; we need its parent to insert after it.
+        const signIn = document.querySelector('.btnLogin')
+            || document.querySelector('button[type="submit"]')
+            || document.querySelector('input[type="submit"]');
+        if (!signIn || !signIn.parentNode) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'jfdLoginCancelBtn';
+        btn.type = 'button';
+        // Mirror the sign-in button's classes but strip the primary action
+        // modifiers so this reads as a secondary/back action.
+        btn.className = (signIn.className || '')
+            .replace(/\bbtnLogin\b/g, '')
+            .replace(/\bbutton-submit\b/g, 'button-flat')
+            .replace(/\bMuiButton-contained\b/g, 'MuiButton-outlined')
+            .replace(/\bMuiButton-containedPrimary\b/g, '')
+            .trim();
+        btn.style.marginTop = '8px';
+        btn.textContent = '← Back to user selection';
+        btn.addEventListener('click', () => {
+            // Restore the credentials that addUser() cleared so Jellyfin
+            // doesn't redirect to its own login page when we navigate home.
+            try {
+                const saved = sessionStorage.getItem(ADD_USER_SAVED_CREDS_KEY);
+                if (saved) writeCredentials(JSON.parse(saved));
+                sessionStorage.removeItem(ADD_USER_SAVED_CREDS_KEY);
+            } catch (err) { /* ignore */ }
+
+            // Navigate back to where we were via hash change (same SPA doc),
+            // then show the picker. The overlay is added to document.body which
+            // persists across hash changes, so it appears as the page renders.
+            let returnHash = '';
+            try {
+                returnHash = sessionStorage.getItem(ADD_USER_SAVED_HASH_KEY) || '';
+                sessionStorage.removeItem(ADD_USER_SAVED_HASH_KEY);
+            } catch (err) {}
+            window.location.hash = returnHash || '!/home.html';
+            showPicker();
+        });
+        signIn.parentNode.insertBefore(btn, signIn.nextSibling);
+    }
+
+    // Tab between login form fields. jellyfin-apiclient's focus manager sets
+    // tabindex="-1" on all inputs and intercepts Tab for spatial navigation,
+    // completely breaking native Tab traversal on the login form.
+    // Strategy: (1) restore tabindex on login inputs so they're in the tab
+    // order; (2) add a capture-phase keydown handler that manually cycles
+    // focus so we win even if Jellyfin's handler also runs.
+    function fixLoginInputTabindex() {
+        if (!isLoginPage()) return;
+        document.querySelectorAll('input[type="text"], input[type="password"], input[type="email"]')
+            .forEach(el => {
+                if (el.getAttribute('tabindex') === '-1') {
+                    el.setAttribute('tabindex', '0');
+                }
+            });
+    }
+
+    function addLoginTabFix() {
+        document.addEventListener('keydown', function(e) {
+            if (e.key !== 'Tab' && e.keyCode !== 9) return;
+            if (!isLoginPage()) return;
+            const active = document.activeElement;
+            if (!active || active === document.body || active === document.documentElement) return;
+            // Search whole document — don't require a <form> ancestor since some
+            // Jellyfin versions use divs instead.
+            const inputs = Array.from(document.querySelectorAll(
+                'input[type="text"], input[type="password"], input[type="email"], input:not([type])'
+            )).filter(el => !el.disabled && el.type !== 'hidden');
+            if (inputs.length < 2) return;
+            // Jellyfin's focus manager sometimes lands focus on a wrapper div
+            // instead of the input itself. Check the element and its descendants.
+            let idx = inputs.indexOf(active);
+            if (idx === -1) {
+                const contained = inputs.find(el => active.contains(el));
+                idx = contained ? inputs.indexOf(contained) : -1;
+            }
+            if (idx === -1) return;
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            const next = e.shiftKey
+                ? inputs[(idx - 1 + inputs.length) % inputs.length]
+                : inputs[(idx + 1) % inputs.length];
+            // Use the prototype directly in case Jellyfin overrides .focus().
+            if (next) HTMLElement.prototype.focus.call(next);
+        }, true);
+    }
+
+    function onDomChange() {
+        installMenuItem();
+        injectLoginCancelButton();
+        fixLoginInputTabindex();
+    }
+
     // window/document always exist, so these listeners can attach immediately.
-    window.addEventListener('pageshow', installMenuItem);
-    document.addEventListener('viewshow', installMenuItem, true);
+    window.addEventListener('pageshow', onDomChange);
+    document.addEventListener('viewshow', onDomChange, true);
 
     // The DOM-dependent setup must wait until <body> exists: this script is
     // injected at document-start, when document.body/documentElement are still
@@ -523,10 +719,22 @@
     function startWhenReady() {
         const target = document.body || document.documentElement;
         if (!target) return;
-        // Install the menu item whenever the preferences page is (re)rendered.
+
+        // Inject a persistent CSS rule that wins over Jellyfin's inline styles.
+        // installMenuItem() adds jfd-settings-overflow-fix to the first ancestor
+        // that clips overflow, keeping Exit Application and Select Server visible.
+        if (!document.getElementById('jfdOverflowStyle')) {
+            const style = document.createElement('style');
+            style.id = 'jfdOverflowStyle';
+            style.textContent = '.jfd-settings-overflow-fix { overflow: visible !important; max-height: none !important; }';
+            (document.head || target).appendChild(style);
+        }
+
+        // Install the menu item and cancel button whenever the page (re)renders.
         // Event-driven only: a scoped MutationObserver, no polling/timeouts.
-        new MutationObserver(() => installMenuItem()).observe(target, { childList: true, subtree: true });
-        installMenuItem();
+        new MutationObserver(onDomChange).observe(target, { childList: true, subtree: true });
+        onDomChange();
+        addLoginTabFix();
         maybeShowStartupPicker();
     }
 
