@@ -207,14 +207,13 @@
         }
         try { sessionStorage.setItem(STARTUP_GUARD_KEY, '1'); } catch (err) { /* ignore */ }
         removePicker();
-        // Full reload, not hash-only navigation: jellyfin-web's login-page
-        // component appears not to fully re-initialize on repeated
-        // same-document mounts in this environment (observed: focus-visible
-        // highlighting works the first time the login page is reached, but
-        // not on subsequent visits within the same document lifetime). A
-        // fresh JS context sidesteps that, same as switchToProfile() and the
-        // "Back to user selection" cancel flow.
-        window.location.href = server.ManualAddress || window.location.origin;
+        // Hash-only navigation keeps the SPA document alive. (A full reload
+        // was tried here on 2026-07-03 as a fix for a Linux-only login-page
+        // focus-highlight bug; it broke that same highlighting on other
+        // platforms without confirming it fixed anything, so it was
+        // reverted. Diagnose the highlight bug separately before touching
+        // this again.)
+        window.location.hash = '!/login.html';
         return true;
     }
 
