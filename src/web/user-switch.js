@@ -182,7 +182,9 @@
         }
         try { sessionStorage.setItem(STARTUP_GUARD_KEY, '1'); } catch (err) { /* ignore */ }
         removePicker();
-        window.location.href = loginUrl(server);
+        // Hash-only navigation keeps the same document alive, avoiding the CEF
+        // focus reset that a full href reload causes on Windows OSR.
+        window.location.hash = '!/login.html';
         return true;
     }
 
