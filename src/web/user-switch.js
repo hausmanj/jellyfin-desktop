@@ -8,6 +8,11 @@
     // Set by the login page's cancel button right before it reloads; tells
     // the next boot to show the picker once, bypassing STARTUP_GUARD_KEY.
     const SHOW_PICKER_ON_LOAD_KEY = 'jfdShowPickerOnLoad';
+    // Armed by switchToProfile just before its reload. If that reload lands on
+    // the login screen while the target token is still valid, maybeRecoverSwitch
+    // re-asserts it and returns home. One-shot, short TTL, token-checked.
+    const PENDING_SWITCH_KEY = 'jfdPendingSwitch';
+    const PENDING_SWITCH_TTL_MS = 15000;
 
     // Class names that are structural to a menu-row icon span. Anything else on
     // a cloned icon span is the source row's glyph and must be stripped so our
@@ -150,10 +155,24 @@
         return server ? server.UserId : '';
     }
 
-    function switchToProfile(profile) {
-        if (!profile || !profile.accessToken || !profile.serverId || !profile.id) return false;
+    // Mirror the token we just wrote to localStorage into jellyfin-web's live
+    // ApiClient, so a late ConnectionManager credential write-back during unload
+    // can't clobber it with a stale value.
+    function syncApiClientAuth(accessToken, userId) {
+        try {
+            const ac = window.ApiClient;
+            if (ac && typeof ac.setAuthenticationInfo === 'function') {
+                ac.setAuthenticationInfo(accessToken, userId);
+            }
+        } catch (err) { /* ignore */ }
+    }
+
+    // Write `profile`'s server + token into jellyfin_credentials and mirror it
+    // into the live ApiClient. Returns the server entry, or null if credentials
+    // are unreadable. Shared by switchToProfile and the self-heal path.
+    function applyProfileCredentials(profile) {
         const credentials = readCredentials();
-        if (!credentials) return false;
+        if (!credentials) return null;
 
         let server = credentials.Servers.find(s => s && s.Id === profile.serverId);
         if (!server) {
@@ -175,11 +194,59 @@
         if (profile.localAddress) server.LocalAddress = profile.localAddress;
 
         writeCredentials(credentials);
+        syncApiClientAuth(server.AccessToken, server.UserId);
+        return server;
+    }
+
+    function clearPendingSwitch() {
+        try { sessionStorage.removeItem(PENDING_SWITCH_KEY); } catch (err) { /* ignore */ }
+    }
+
+    function switchToProfile(profile) {
+        if (!profile || !profile.accessToken || !profile.serverId || !profile.id) return false;
+        const server = applyProfileCredentials(profile);
+        if (!server) return false;
+
         captureCurrentProfile();
         // Switching triggers a reload; keep the startup picker from re-appearing.
         try { sessionStorage.setItem(STARTUP_GUARD_KEY, '1'); } catch (err) { /* ignore */ }
+        // Arm self-heal in case this reload lands on the login screen despite a
+        // still-valid token (see maybeRecoverSwitch).
+        try {
+            sessionStorage.setItem(PENDING_SWITCH_KEY, JSON.stringify({
+                id: server.UserId, serverId: server.Id, t: Date.now()
+            }));
+        } catch (err) { /* ignore */ }
         window.location.href = server.ManualAddress || window.location.origin;
         return true;
+    }
+
+    // Self-heal for the rare case where a switch reloads straight into the login
+    // screen (seen under heavy switching — most likely a transient /System/Info
+    // failure over the network that made jellyfin-web drop the token). If the
+    // target profile's token still authenticates, re-assert it and go home.
+    // Guards: one-shot (flag cleared before acting), short TTL, and a live token
+    // check — so a genuine Sign Out is never overridden and it can never loop.
+    function maybeRecoverSwitch() {
+        let pending;
+        try { pending = JSON.parse(sessionStorage.getItem(PENDING_SWITCH_KEY) || 'null'); }
+        catch (err) { pending = null; }
+        if (!pending || !pending.id) return;
+        if (!pending.t || (Date.now() - pending.t) > PENDING_SWITCH_TTL_MS) { clearPendingSwitch(); return; }
+        if (!isLoginPage()) return;
+
+        clearPendingSwitch();
+        const profile = allProfiles().find(p => p.id === pending.id && p.serverId === pending.serverId);
+        if (!profile || !profile.accessToken) return;
+
+        const base = (profile.manualAddress || profile.localAddress || window.location.origin).replace(/\/$/, '');
+        fetch(base + '/System/Info', { headers: { 'X-Emby-Token': profile.accessToken } })
+            .then(res => {
+                if (!res.ok) return; // genuine logout / invalid token: leave login alone
+                const server = applyProfileCredentials(profile);
+                if (server) window.location.href = server.ManualAddress || window.location.origin;
+            })
+            .catch(() => { /* network error: leave the login screen as-is */ });
     }
 
     function loginUrl(server) {
@@ -188,6 +255,9 @@
     }
 
     function addUser() {
+        // Adding a user is deliberate — don't let a prior switch's self-heal
+        // fire on the login page we're about to open.
+        clearPendingSwitch();
         const credentials = readCredentials();
         const server = activeServer(credentials) || lastServer(credentials) || {
             ManualAddress: window.location.origin,
@@ -663,8 +733,10 @@
                     const parsed = JSON.parse(saved);
                     writeCredentials(parsed);
                     restoredServer = activeServer(parsed) || lastServer(parsed);
+                    if (restoredServer) syncApiClientAuth(restoredServer.AccessToken, restoredServer.UserId);
                 }
                 sessionStorage.removeItem(ADD_USER_SAVED_CREDS_KEY);
+                clearPendingSwitch();
             } catch (err) { /* ignore */ }
 
             // A full reload is required here, not a hash-only navigation:
@@ -732,6 +804,7 @@
         installMenuItem();
         injectLoginCancelButton();
         fixLoginInputTabindex();
+        maybeRecoverSwitch();
     }
 
     // window/document always exist, so these listeners can attach immediately.
