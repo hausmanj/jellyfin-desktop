@@ -66,6 +66,18 @@
         return 'Unknown user';
     }
 
+    function deleteProfile(profile) {
+        const store = readStore();
+        const server = store.servers[profile.serverId];
+        if (server && server.users) {
+            delete server.users[profile.id];
+            if (Object.keys(server.users).length === 0) {
+                delete store.servers[profile.serverId];
+            }
+        }
+        writeStore(store);
+    }
+
     function captureCurrentProfile() {
         const credentials = readCredentials();
         const server = activeServer(credentials);
@@ -262,6 +274,18 @@
             badge.textContent = 'Current';
             badge.style.cssText = 'font-size:.78rem;opacity:.75';
             btn.appendChild(badge);
+        } else {
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.textContent = '×';
+            del.title = 'Remove profile';
+            del.style.cssText = 'background:transparent;border:0;color:#fff;opacity:.5;cursor:pointer;font-size:1.4rem;padding:0 4px;line-height:1;flex:0 0 auto';
+            del.addEventListener('click', (event) => {
+                event.stopPropagation();
+                deleteProfile(profile);
+                showPicker();
+            });
+            btn.appendChild(del);
         }
 
         btn.addEventListener('click', () => switchToProfile(profile));
@@ -480,7 +504,8 @@
         profiles: allProfiles,
         showPicker,
         switchToProfile,
-        addUser
+        addUser,
+        deleteProfile
     };
 
     // Keep the saved-profile store fresh from real navigation/login events.
