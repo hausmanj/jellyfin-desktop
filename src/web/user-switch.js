@@ -5,7 +5,9 @@
     const STARTUP_GUARD_KEY = 'jfdStartupPickerShown';
     // Saved before addUser() clears credentials; restored on cancel.
     const ADD_USER_SAVED_CREDS_KEY = 'jfdPreAddUserCreds';
-    const ADD_USER_SAVED_HASH_KEY  = 'jfdPreAddUserHash';
+    // Set by the login page's cancel button right before it reloads; tells
+    // the next boot to show the picker once, bypassing STARTUP_GUARD_KEY.
+    const SHOW_PICKER_ON_LOAD_KEY = 'jfdShowPickerOnLoad';
 
     // Class names that are structural to a menu-row icon span. Anything else on
     // a cloned icon span is the source row's glyph and must be stripped so our
@@ -193,10 +195,9 @@
         };
 
         captureCurrentProfile();
-        // Save credentials and current hash so cancel can restore both.
+        // Save credentials so cancel can restore them.
         try {
             sessionStorage.setItem(ADD_USER_SAVED_CREDS_KEY, JSON.stringify(readCredentials()));
-            sessionStorage.setItem(ADD_USER_SAVED_HASH_KEY, window.location.hash || '');
         } catch (err) { /* ignore */ }
         if (credentials && Array.isArray(credentials.Servers)) {
             delete server.AccessToken;
@@ -206,9 +207,14 @@
         }
         try { sessionStorage.setItem(STARTUP_GUARD_KEY, '1'); } catch (err) { /* ignore */ }
         removePicker();
-        // Hash-only navigation keeps the SPA document alive so cancel can
-        // restore credentials and call showPicker() without a full reload.
-        window.location.hash = '!/login.html';
+        // Full reload, not hash-only navigation: jellyfin-web's login-page
+        // component appears not to fully re-initialize on repeated
+        // same-document mounts in this environment (observed: focus-visible
+        // highlighting works the first time the login page is reached, but
+        // not on subsequent visits within the same document lifetime). A
+        // fresh JS context sidesteps that, same as switchToProfile() and the
+        // "Back to user selection" cancel flow.
+        window.location.href = server.ManualAddress || window.location.origin;
         return true;
     }
 
@@ -405,10 +411,24 @@
     // Startup picker: only worth showing when there is a genuine choice to make
     // (2+ saved profiles) and only once per app session — never on every reload.
     function maybeShowStartupPicker() {
+        captureCurrentProfile();
+
+        // The login page's "Back to user selection" button sets this right
+        // before reloading — always honor it once, regardless of the
+        // once-per-session guard or profile count.
+        let showOnLoad = false;
+        try {
+            showOnLoad = !!sessionStorage.getItem(SHOW_PICKER_ON_LOAD_KEY);
+            sessionStorage.removeItem(SHOW_PICKER_ON_LOAD_KEY);
+        } catch (err) { /* ignore */ }
+        if (showOnLoad) {
+            showPicker();
+            return;
+        }
+
         try {
             if (sessionStorage.getItem(STARTUP_GUARD_KEY)) return;
         } catch (err) { /* sessionStorage unavailable: fall through and show once */ }
-        captureCurrentProfile();
         if (allProfiles().length < 2) return;
         try { sessionStorage.setItem(STARTUP_GUARD_KEY, '1'); } catch (err) { /* ignore */ }
         showPicker();
@@ -635,24 +655,30 @@
         btn.style.marginTop = '8px';
         btn.textContent = '← Back to user selection';
         btn.addEventListener('click', () => {
-            // Restore the credentials that addUser() cleared so Jellyfin
-            // doesn't redirect to its own login page when we navigate home.
+            // Restore the credentials that addUser() cleared, and read back
+            // which server to land on.
+            let restoredServer = null;
             try {
                 const saved = sessionStorage.getItem(ADD_USER_SAVED_CREDS_KEY);
-                if (saved) writeCredentials(JSON.parse(saved));
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    writeCredentials(parsed);
+                    restoredServer = activeServer(parsed) || lastServer(parsed);
+                }
                 sessionStorage.removeItem(ADD_USER_SAVED_CREDS_KEY);
             } catch (err) { /* ignore */ }
 
-            // Navigate back to where we were via hash change (same SPA doc),
-            // then show the picker. The overlay is added to document.body which
-            // persists across hash changes, so it appears as the page renders.
-            let returnHash = '';
-            try {
-                returnHash = sessionStorage.getItem(ADD_USER_SAVED_HASH_KEY) || '';
-                sessionStorage.removeItem(ADD_USER_SAVED_HASH_KEY);
-            } catch (err) {}
-            window.location.hash = returnHash || '!/home.html';
-            showPicker();
+            // A full reload is required here, not a hash-only navigation:
+            // jellyfin-web's own ConnectionManager keeps in-memory session
+            // state from when addUser() cleared the live credentials, and
+            // will write that stale "logged out" state back over our
+            // restored localStorage credentials if the SPA document stays
+            // alive. Reloading gets a fresh JS context that reads the
+            // restored credentials correctly — the same reason
+            // switchToProfile() always reloads.
+            try { sessionStorage.setItem(SHOW_PICKER_ON_LOAD_KEY, '1'); } catch (err) { /* ignore */ }
+            const target = (restoredServer && restoredServer.ManualAddress) || window.location.origin;
+            window.location.href = target;
         });
         signIn.parentNode.insertBefore(btn, signIn.nextSibling);
     }
