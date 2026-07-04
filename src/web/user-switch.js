@@ -1,5 +1,4 @@
 (function() {
-    console.warn('[JFD] user-switch.js loaded, hash=' + window.location.hash);
     const STORE_KEY = 'jellyfin_desktop_user_profiles_v1';
     const CREDENTIALS_KEY = 'jellyfin_credentials';
     const STARTUP_GUARD_KEY = 'jfdStartupPickerShown';
@@ -563,17 +562,11 @@
         if (!isPreferencesPage()) return false;
 
         const existing = document.getElementById('jfdSelectUserSettingsItem');
-        if (existing) {
-            console.warn('[JFD] installMenuItem: row exists, parentNode=' +
-                (existing.parentNode ? existing.parentNode.tagName + '.' + existing.parentNode.className.slice(0,40) : 'DETACHED'));
-            return true;
-        }
+        if (existing) return true;
 
         const signOut = findRowByLabel('Sign Out');
         const selectServer = findRowByLabel('Select Server');
         const exitApplication = findRowByLabel('Exit Application');
-        console.warn('[JFD] installMenuItem: signOut=' + !!signOut +
-            ' selectServer=' + !!selectServer + ' exitApp=' + !!exitApplication);
         const reference = signOut || selectServer || exitApplication;
         if (!reference || !reference.parentNode) return false;
 
@@ -613,61 +606,26 @@
         }
 
         // Walk ancestors to find and fix the element clipping our extra row.
-        // We look for overflow:hidden OR a max-height constraint — both can
-        // clip content. Log the full chain so we can see what's constraining.
-        let fixedEl = null;
-        let depth = 0;
+        // An overflow:hidden or max-height constraint on a scroll container can
+        // clip the added row, hiding Exit Application / Select Server.
         let el = row.parentNode;
         while (el && el !== document.body) {
             const cs = window.getComputedStyle(el);
             const hasOverflowHidden = cs.overflow === 'hidden' || cs.overflowY === 'hidden';
             const hasMaxHeight = cs.maxHeight !== 'none' && cs.maxHeight !== '' && cs.maxHeight !== '0px';
-            console.warn('[JFD] ancestor[' + depth + '] <' + el.tagName + '> class="' +
-                el.className.slice(0, 50) + '" overflow=' + cs.overflow +
-                ' overflowY=' + cs.overflowY + ' height=' + cs.height + ' maxHeight=' + cs.maxHeight);
             if (hasOverflowHidden || hasMaxHeight) {
-                el.classList.add('jfd-settings-overflow-fix');
-                console.warn('[JFD] → tagged ancestor[' + depth + '] with jfd-settings-overflow-fix' +
-                    (hasOverflowHidden ? ' (overflow:hidden)' : '') +
-                    (hasMaxHeight ? ' (maxHeight=' + cs.maxHeight + ')' : ''));
-                fixedEl = el;
-                // Watch for the class being stripped back off.
+                const fixedEl = el;
+                fixedEl.classList.add('jfd-settings-overflow-fix');
+                // Re-add the class if jellyfin-web strips it on a re-render.
                 new MutationObserver(() => {
-                    if (!el.classList.contains('jfd-settings-overflow-fix')) {
-                        console.warn('[JFD] WARNING: jfd-settings-overflow-fix removed from ancestor[' + depth + '] — re-adding');
-                        el.classList.add('jfd-settings-overflow-fix');
+                    if (!fixedEl.classList.contains('jfd-settings-overflow-fix')) {
+                        fixedEl.classList.add('jfd-settings-overflow-fix');
                     }
-                }).observe(el, { attributes: true, attributeFilter: ['class'] });
+                }).observe(fixedEl, { attributes: true, attributeFilter: ['class'] });
                 break;
             }
             el = el.parentNode;
-            depth++;
         }
-        if (!fixedEl) {
-            console.warn('[JFD] WARNING: no clipping ancestor found after ' + depth + ' levels');
-        }
-
-        // Watch for our row or any sibling being removed from the parent.
-        const parent = row.parentNode;
-        const siblingsBefore = Array.from(parent.children).map(c =>
-            (c.id || '') + ':' + c.className.slice(0,20));
-        console.warn('[JFD] siblings at insertion: [' + siblingsBefore.join(', ') + ']');
-        new MutationObserver((muts) => {
-            for (const m of muts) {
-                for (const n of m.removedNodes) {
-                    if (n.nodeType === 1) {
-                        console.warn('[JFD] REMOVED from parent: id=' + n.id +
-                            ' class=' + n.className.slice(0,30));
-                    }
-                }
-                for (const n of m.addedNodes) {
-                    if (n.nodeType === 1) {
-                        console.warn('[JFD] ADDED to parent: id=' + n.id +
-                            ' class=' + n.className.slice(0,30));
-                    }
-                }
-            }
-        }).observe(parent, { childList: true });
 
         return true;
     }
