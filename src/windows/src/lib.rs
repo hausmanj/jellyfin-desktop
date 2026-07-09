@@ -348,6 +348,30 @@ impl Platform for WindowsPlatform {
         win_cleanup();
     }
 
+    /// Overrides the default inline `f()` to bound how long shutdown can
+    /// block. The only caller today is `jfn_mpv_handle_terminate` (i.e.
+    /// `mpv_terminate_destroy`), which can hang forever if mpv's D3D11 VO
+    /// wedged on a lost/removed GPU device (e.g. after an HDMI hotplug) —
+    /// previously this required killing the process via Task Manager. See
+    /// memory `project-jellyfin-windows-tv-hotplug`. Past the timeout we
+    /// know for certain the callback is stuck, not merely slow, so force-exit
+    /// rather than leave the process as an unkillable-by-normal-means zombie.
+    fn run_blocking(&self, f: Box<dyn FnOnce() + Send>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+            tracing::error!(
+                target: "platform",
+                "run_blocking: teardown callback did not return within 5s \
+                 (likely a wedged mpv VO teardown after GPU device loss) — forcing exit"
+            );
+            std::process::exit(1);
+        }
+    }
+
     fn alloc_surface(&self) -> SurfaceHandle {
         win_alloc_surface()
     }

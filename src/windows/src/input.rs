@@ -37,13 +37,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_STYLE, WM_APPCOMMAND, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
     WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_VISIBLE, XBUTTON2,
 };
 use windows::core::{PCWSTR, w};
 
 // Not re-exported by windows-rs 0.62's WindowsAndMessaging metadata.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+// Thread message (no HWND) posted to the input thread to re-assert focus
+// onto the input child window. Used on the display-change/activate path
+// after a hotplug-style focus churn — see `jfn_input_windows_reassert_focus`
+// and memory `project-jellyfin-windows-tv-hotplug`.
+const WM_JFN_REASSERT_FOCUS: u32 = WM_USER + 1;
 
 // =====================================================================
 // CEF cursor-type ordinals + event flags (mirrors cef_types.h)
@@ -443,10 +449,16 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_SETFOCUS => {
+            tracing::info!(target: "platform", "input_wndproc: WM_SETFOCUS");
             jfn_input_dispatch_keyboard_focus(1);
             return LRESULT(0);
         }
         WM_KILLFOCUS => {
+            // Diagnostic for the TV-hotplug mouse-loss bug: if this fires
+            // during a display-topology change and no later WM_SETFOCUS
+            // follows, the input child window never regains focus. See
+            // memory `project-jellyfin-windows-tv-hotplug`.
+            tracing::info!(target: "platform", "input_wndproc: WM_KILLFOCUS");
             jfn_input_dispatch_keyboard_focus(0);
             return LRESULT(0);
         }
@@ -530,6 +542,18 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     // Standard GetMessage/Dispatch loop.
     let mut m = MSG::default();
     while unsafe { GetMessageW(&mut m, None, 0, 0).0 } > 0 {
+        // Thread messages (posted via PostThreadMessageW) carry a null HWND
+        // and never reach input_wndproc through Dispatch, so handle them
+        // here instead.
+        if m.hwnd.is_invalid() && m.message == WM_JFN_REASSERT_FOCUS {
+            let hwnd_raw = STATE.lock().input_hwnd_raw;
+            if hwnd_raw != 0 {
+                let target = HWND(hwnd_raw as *mut std::ffi::c_void);
+                let ok = unsafe { SetFocus(Some(target)) };
+                tracing::info!(target: "platform", "reassert_focus: SetFocus -> {:?}", ok.is_ok());
+            }
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&m);
             DispatchMessageW(&m);
@@ -544,11 +568,33 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     STATE.lock().thread_id = 0;
 }
 
+/// Re-assert focus onto the input child window. Posted from the mpv
+/// WndProc hook's display-change/activate path (`platform.rs`) to recover
+/// from the TV-hotplug focus churn that otherwise leaves mouse/keyboard
+/// input stranded. Must run on the input thread — `SetFocus` needs to be
+/// called by (or on behalf of) a thread whose input queue is attached to
+/// the target window's, which is only guaranteed on the input thread
+/// itself — so this posts a thread message rather than calling `SetFocus`
+/// directly from the hook. See memory `project-jellyfin-windows-tv-hotplug`.
+pub fn jfn_input_windows_reassert_focus() {
+    let tid = STATE.lock().thread_id;
+    if tid != 0 {
+        let _ = unsafe { PostThreadMessageW(tid, WM_JFN_REASSERT_FOCUS, WPARAM(0), LPARAM(0)) };
+    }
+}
+
 pub fn jfn_input_windows_stop_input_thread() {
     let tid = STATE.lock().thread_id;
     if tid != 0 {
         let _ = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
     }
+}
+
+/// Diagnostic accessor: current input child HWND (raw), or 0 before/after
+/// the input thread runs. Lets `platform.rs` compare it against `GetFocus()`
+/// after display-change events. See `project-jellyfin-windows-tv-hotplug`.
+pub fn jfn_input_windows_get_hwnd() -> usize {
+    STATE.lock().input_hwnd_raw
 }
 
 pub fn jfn_input_windows_resize_to_parent(pw: c_int, ph: c_int) {

@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CWPRETSTRUCT, CallNextHookEx, GWL_STYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HHOOK, IsIconic, IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA,
@@ -39,6 +40,7 @@ use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 // Input thread lives in `crate::input`.
 use crate::input::{
+    jfn_input_windows_get_hwnd, jfn_input_windows_reassert_focus,
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
     jfn_input_windows_stop_input_thread,
 };
@@ -96,6 +98,18 @@ pub fn jfn_win_get_hwnd() -> *mut c_void {
 fn is_fullscreen_style(style: isize) -> bool {
     let s = style as u32;
     (s & WS_CAPTION.0) == 0 && (s & WS_THICKFRAME.0) == 0
+}
+
+fn display_event_name(msg: u32) -> &'static str {
+    match msg {
+        m if m == WM_ACTIVATEAPP => "WM_ACTIVATEAPP",
+        m if m == WM_SETFOCUS => "WM_SETFOCUS",
+        m if m == WM_DISPLAYCHANGE => "WM_DISPLAYCHANGE",
+        m if m == WM_SETTINGCHANGE => "WM_SETTINGCHANGE",
+        m if m == WM_WINDOWPOSCHANGED => "WM_WINDOWPOSCHANGED",
+        m if m == WM_SHOWWINDOW => "WM_SHOWWINDOW",
+        _ => "WM_?",
+    }
 }
 
 // =====================================================================
@@ -338,6 +352,27 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                 // overlay and compositor on each event as Windows fires them when
                 // geometry has settled.
                 refresh_geometry_from_hwnd(target_hwnd_raw);
+
+                // Diagnostic for the TV-hotplug mouse-loss bug: log whether
+                // focus was still on the input child HWND right before we
+                // re-assert it below. See memory
+                // `project-jellyfin-windows-tv-hotplug`.
+                let focus_hwnd = unsafe { GetFocus() };
+                let input_hwnd_raw = jfn_input_windows_get_hwnd();
+                tracing::info!(
+                    target: "platform",
+                    "mpv_wndproc_hook: {} focus_hwnd={:#x} input_hwnd={:#x} focus_on_input={}",
+                    display_event_name(msg.message),
+                    focus_hwnd.0 as usize,
+                    input_hwnd_raw,
+                    focus_hwnd.0 as usize == input_hwnd_raw,
+                );
+
+                // Fix: hotplug-driven focus churn can leave the input child
+                // window without focus with nothing to re-assert it. Post a
+                // re-assert to the input thread on every event on this path;
+                // it's a no-op if focus is already correct.
+                jfn_input_windows_reassert_focus();
             }
         }
     }

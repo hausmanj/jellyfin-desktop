@@ -100,6 +100,10 @@ unsafe impl Send for Surface {}
 
 struct State {
     devices: Option<CompositorDevices>,
+    // mpv's HWND, retained so a lost D3D device can be torn down and
+    // recreated in place (`recover_from_device_loss`) without needing the
+    // caller to re-run `jfn_win_init_compositor`.
+    hwnd: HWND,
     // Surface registry (live + stack order + main) shared with macOS via
     // jfn-compositor-core.
     surfaces: SurfaceStack<*mut Surface>,
@@ -116,6 +120,7 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<State> = Mutex::new(State {
     devices: None,
+    hwnd: HWND(std::ptr::null_mut()),
     surfaces: SurfaceStack::new(),
     gate: TransitionGate::new(),
     mpv_pw: 0,
@@ -142,6 +147,7 @@ pub fn jfn_win_init_compositor(hwnd: *mut c_void) -> bool {
     if st.devices.is_some() {
         return true;
     }
+    st.hwnd = hwnd;
     match init_devices(hwnd) {
         Ok(d) => {
             st.devices = Some(d);
@@ -241,6 +247,110 @@ fn detach_surface(s: &mut Surface, devices: Option<&CompositorDevices>) {
     }
 }
 
+/// Rebuilds every D3D11/DComp device and re-creates all existing surfaces'
+/// visuals in place after the GPU adapter was lost/reset (e.g. an HDMI
+/// hotplug causing `DXGI_ERROR_DEVICE_REMOVED`). Without this, every
+/// surface silently stopped presenting for the rest of the session once the
+/// original device died — the overlay would freeze on its last good frame
+/// even though CEF kept rendering normally underneath. Triggered directly
+/// from the Present-failure path once `device_removed` confirms an actual
+/// device loss; never polled. Surface pointer identity is preserved (the
+/// CEF layer holds onto it across recovery) — only the visual/swap-chain
+/// internals are torn down and rebuilt. See memory
+/// `project-jellyfin-windows-tv-hotplug`.
+fn recover_from_device_loss(st: &mut State) {
+    if st.hwnd.is_invalid() {
+        return;
+    }
+    tracing::warn!(target: "platform", "recovering compositor from GPU device loss");
+
+    // Best-effort detach against the dying device — these COM calls may
+    // themselves fail since the device is already gone, which is fine.
+    let live: Vec<*mut Surface> = st.surfaces.live().to_vec();
+    for ptr in &live {
+        if ptr.is_null() {
+            continue;
+        }
+        unsafe {
+            detach_surface(&mut **ptr, st.devices.as_ref());
+        }
+    }
+    let prev_stack: Vec<*mut Surface> = st.surfaces.stack().to_vec();
+
+    st.devices = None;
+    let devices = match init_devices(st.hwnd) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(target: "platform", "device-loss recovery: init_devices failed: {e:?}");
+            return;
+        }
+    };
+
+    // Re-create each live surface's visual(s) against the new dcomp device.
+    // Swap chains rebuild lazily via `ensure_swap_chain` on next present.
+    for ptr in &live {
+        if ptr.is_null() {
+            continue;
+        }
+        unsafe {
+            let s = &mut **ptr;
+            let visual = match devices.dcomp_device.CreateVisual() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(target: "platform", "device-loss recovery: CreateVisual failed: {e:?}");
+                    continue;
+                }
+            };
+            let popup = devices.dcomp_device.CreateVisual().ok();
+            if let Some(pv) = popup.as_ref() {
+                let _ = visual.AddVisual(pv, true, None::<&IDCompositionVisual>);
+            }
+            s.visual = Some(visual);
+            s.popup_visual = popup;
+            s.swap_chain = None;
+            s.sw = 0;
+            s.sh = 0;
+            s.popup_swap_chain = None;
+            s.popup_sw = 0;
+            s.popup_sh = 0;
+            s.in_tree = false;
+        }
+    }
+
+    // Re-stack in the pre-recovery order (mirrors `win_restack`).
+    st.surfaces.clear_stack();
+    let mut prev_visual: Option<IDCompositionVisual> = None;
+    for ptr in &prev_stack {
+        if ptr.is_null() {
+            continue;
+        }
+        unsafe {
+            let s = &mut **ptr;
+            let Some(visual) = s.visual.as_ref() else {
+                continue;
+            };
+            let hr = if let Some(prev) = prev_visual.as_ref() {
+                devices.dcomp_root.AddVisual(visual, true, prev)
+            } else {
+                devices.dcomp_root.AddVisual(visual, false, None::<&IDCompositionVisual>)
+            };
+            if let Err(e) = hr {
+                tracing::error!(target: "platform", "device-loss recovery: restack AddVisual failed: {e:?}");
+                continue;
+            }
+            s.in_tree = true;
+            st.surfaces.push_stack(*ptr);
+            prev_visual = Some(visual.clone());
+        }
+    }
+    st.surfaces.set_main_to_stack_first();
+    unsafe {
+        let _ = devices.dcomp_device.Commit();
+    }
+    st.devices = Some(devices);
+    tracing::info!(target: "platform", "compositor recovered from device loss");
+}
+
 // =====================================================================
 // Swap-chain helpers (locked).
 // =====================================================================
@@ -309,6 +419,12 @@ fn ensure_swap_chain(
                 DXGI_SWAP_CHAIN_FLAG(0),
             )
         };
+        if let Err(e) = &resize {
+            tracing::warn!(target: "platform", "ResizeBuffers failed, recreating swap chain: {e:?}");
+            // Recovery is wired at the call site with `&mut State` access
+            // (`win_surface_present`); here we can only flag it in the log.
+            let _ = device_removed(&devices.d3d_device);
+        }
         if resize.is_ok() {
             *sw = w;
             *sh = h;
@@ -330,15 +446,48 @@ fn ensure_swap_chain(
     }
 }
 
-fn present_to_swap_chain(devices: &CompositorDevices, sc: &IDXGISwapChain1, src: &ID3D11Texture2D) {
+/// Logs whether the D3D device has been removed/reset and, if so, the
+/// reason HRESULT, returning `true` if it has. `GetDeviceRemovedReason`
+/// returns `Ok(())` while the device is alive, so this is only informative
+/// when called right after a Present/GetBuffer failure. See memory
+/// `project-jellyfin-windows-tv-hotplug`.
+fn device_removed(device: &ID3D11Device1) -> bool {
+    unsafe {
+        if let Err(e) = device.GetDeviceRemovedReason() {
+            tracing::error!(target: "platform", "device removed/reset, reason: {e:?}");
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Returns `true` if the D3D device was confirmed removed/reset during this
+/// present attempt, so the caller can trigger `recover_from_device_loss`.
+fn present_to_swap_chain(
+    devices: &CompositorDevices,
+    sc: &IDXGISwapChain1,
+    src: &ID3D11Texture2D,
+) -> bool {
     unsafe {
         match sc.GetBuffer::<ID3D11Texture2D>(0) {
             Ok(bb) => {
                 devices.d3d_context.CopyResource(&bb, src);
-                let _ = sc.Present(0, DXGI_PRESENT(0));
-                let _ = devices.dcomp_device.Commit();
+                let present_hr = sc.Present(0, DXGI_PRESENT(0));
+                let mut lost = false;
+                if present_hr.is_err() {
+                    tracing::error!(target: "platform", "swap-chain Present failed: {present_hr:?}");
+                    lost = device_removed(&devices.d3d_device);
+                }
+                if let Err(e) = devices.dcomp_device.Commit() {
+                    tracing::error!(target: "platform", "dcomp Commit failed after present: {e:?}");
+                }
+                lost
             }
-            Err(e) => tracing::error!(target: "platform", "GetBuffer failed: {e:?}"),
+            Err(e) => {
+                tracing::error!(target: "platform", "GetBuffer failed: {e:?}");
+                device_removed(&devices.d3d_device)
+            }
         }
     }
 }
@@ -560,7 +709,9 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
         Some(sc) => sc.clone(),
         None => return false,
     };
-    present_to_swap_chain(devices, &sc, &src);
+    if present_to_swap_chain(devices, &sc, &src) {
+        recover_from_device_loss(&mut st);
+    }
     true
 }
 
@@ -644,7 +795,9 @@ pub fn win_surface_present_software(
         Some(sc) => sc.clone(),
         None => return false,
     };
-    present_to_swap_chain(devices, &sc, &src);
+    if present_to_swap_chain(devices, &sc, &src) {
+        recover_from_device_loss(&mut st);
+    }
     true
 }
 
@@ -859,7 +1012,7 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
     if handle.is_null() {
         return;
     }
-    let st = STATE.lock();
+    let mut st = STATE.lock();
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -901,7 +1054,9 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
         Some(sc) => sc.clone(),
         None => return,
     };
-    present_to_swap_chain(devices, &sc, &src);
+    if present_to_swap_chain(devices, &sc, &src) {
+        recover_from_device_loss(&mut st);
+    }
 }
 
 pub fn win_popup_present_software(
@@ -915,7 +1070,7 @@ pub fn win_popup_present_software(
     if s.is_null() || buffer.is_null() || pw <= 0 || ph <= 0 {
         return;
     }
-    let st = STATE.lock();
+    let mut st = STATE.lock();
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -976,5 +1131,7 @@ pub fn win_popup_present_software(
         Some(sc) => sc.clone(),
         None => return,
     };
-    present_to_swap_chain(devices, &sc, &src);
+    if present_to_swap_chain(devices, &sc, &src) {
+        recover_from_device_loss(&mut st);
+    }
 }
