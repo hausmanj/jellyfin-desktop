@@ -301,7 +301,13 @@ fn apply_boot_options(handle: &Handle, boot: &JfnMpvBoot) -> crate::error::Resul
     if let Some(spdif) = unsafe { cstr_opt(boot.audio_passthrough) }
         && !spdif.is_empty()
     {
+        tracing::info!(target: "mpv", "audio-spdif ENABLED (passthrough): {spdif}");
         set("audio-spdif", &spdif)?;
+    } else {
+        tracing::info!(
+            target: "mpv",
+            "audio-spdif OFF (PCM) — passthrough list empty (device-gated: output can't bitstream)"
+        );
     }
     if boot.audio_exclusive {
         set_flag("audio-exclusive", true)?;

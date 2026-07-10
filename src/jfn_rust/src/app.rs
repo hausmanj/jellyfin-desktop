@@ -201,6 +201,20 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
         audio_passthrough = normalize_passthrough(&audio_passthrough);
     }
 
+    // macOS: only bitstream (passthrough) when the current default output can
+    // actually carry a compressed stream — i.e. HDMI/DisplayPort to a receiver.
+    // Built-in speakers/headphones can't; attempting exclusive-mode passthrough
+    // there fails negotiation ("no usable substream") and stalls playback. Drop
+    // the list so mpv decodes to PCM. On a receiver the list is applied as normal.
+    #[cfg(target_os = "macos")]
+    if !audio_passthrough.is_empty() && !macos_output_supports_passthrough() {
+        tracing::info!(
+            target: "Main",
+            "default audio output can't bitstream (not HDMI/DisplayPort) — using PCM, skipping passthrough"
+        );
+        audio_passthrough.clear();
+    }
+
     StartupOptions {
         hwdec,
         audio_passthrough,
@@ -210,6 +224,87 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
         log_file,
         disable_gpu_compositing,
         remote_debugging_port,
+    }
+}
+
+/// macOS: does the current default output device support compressed-audio
+/// passthrough (bitstream)? Only HDMI/DisplayPort (a receiver/AVR) reliably do.
+/// Built-in speakers/headphones, Bluetooth, AirPlay, etc. cannot — attempting
+/// passthrough there stalls playback — so callers fall back to PCM in that case.
+/// On any query failure we return `false` (the safe choice: never stall).
+#[cfg(target_os = "macos")]
+fn macos_output_supports_passthrough() -> bool {
+    use std::os::raw::c_void;
+
+    #[repr(C)]
+    struct PropAddr {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    unsafe extern "C" {
+        fn AudioObjectGetPropertyData(
+            in_id: u32,
+            in_addr: *const PropAddr,
+            in_qual_size: u32,
+            in_qual: *const c_void,
+            io_size: *mut u32,
+            out_data: *mut c_void,
+        ) -> i32;
+    }
+
+    // FourCC → u32 (CoreAudio selectors/values are four-char codes).
+    const fn cc(s: &[u8; 4]) -> u32 {
+        ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
+    }
+
+    let scope = cc(b"glob"); // kAudioObjectPropertyScopeGlobal
+    unsafe {
+        // kAudioObjectSystemObject = 1 → default output device.
+        let mut dev: u32 = 0;
+        let mut sz: u32 = 4;
+        let addr_dev = PropAddr {
+            selector: cc(b"dOut"), // kAudioHardwarePropertyDefaultOutputDevice
+            scope,
+            element: 0, // kAudioObjectPropertyElementMain
+        };
+        if AudioObjectGetPropertyData(
+            1,
+            &addr_dev,
+            0,
+            std::ptr::null(),
+            &mut sz,
+            (&mut dev as *mut u32).cast(),
+        ) != 0
+            || dev == 0
+        {
+            return false;
+        }
+
+        // Transport type of that device.
+        let mut transport: u32 = 0;
+        let mut sz2: u32 = 4;
+        let addr_tr = PropAddr {
+            selector: cc(b"tran"), // kAudioDevicePropertyTransportType
+            scope,
+            element: 0,
+        };
+        if AudioObjectGetPropertyData(
+            dev,
+            &addr_tr,
+            0,
+            std::ptr::null(),
+            &mut sz2,
+            (&mut transport as *mut u32).cast(),
+        ) != 0
+        {
+            return false;
+        }
+
+        // kAudioDeviceTransportTypeHDMI = 'hdmi', DisplayPort = 'dprt'.
+        transport == cc(b"hdmi") || transport == cc(b"dprt")
     }
 }
 
