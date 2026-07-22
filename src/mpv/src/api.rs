@@ -372,7 +372,6 @@ pub struct JfnMpvLoadOptions {
     pub external_audio_url: *const c_char,
     pub external_sub_url: *const c_char,
     pub is_infinite_stream: bool,
-    pub is_dolby_vision: bool,
 }
 
 struct PendingTrack {
@@ -436,12 +435,6 @@ pub unsafe fn jfn_mpv_load_file(path: *const c_char, opts: *const JfnMpvLoadOpti
         s.external_sub_url = ext_sub;
         s.defer_audio_to_mpv = defer_audio;
         s.valid = true;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let hint = if o.is_dolby_vision { c"no" } else { c"yes" };
-        unsafe { set_str(c"target-colorspace-hint", hint) };
     }
 
     let mut opts_str = format!("start={},pause=yes", o.start_secs);
