@@ -16,9 +16,10 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
-    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_QUERY_DESC,
+    D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
+    ID3D11Query, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -129,10 +130,40 @@ static STATE: Mutex<State> = Mutex::new(State {
     pending_lh: 0,
 });
 
+/// Max time to wait for `STATE` before giving up and logging. A real
+/// deadlock elsewhere can't be fixed by waiting longer, but an unbounded
+/// `.lock()` turns that deadlock into a silent, unrecoverable native-thread
+/// hang with zero diagnostic trace — which is exactly what the 2026-07-10
+/// and 2026-07-12 TV freezes looked like (GPU device stayed alive, CEF's
+/// JS/websocket thread stayed alive, but native paint/restack calls and even
+/// `jfn_win_cleanup_compositor` during shutdown went completely silent with
+/// no error ever logged). A timed lock turns that into a bounded wait plus a
+/// log line naming the stuck call site, and keeps a wedged `STATE` from
+/// blocking `shutdown_runtime` forever. See memory
+/// `project-jellyfin-windows-tv-hotplug`.
+const STATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn lock_state(caller: &str) -> Option<parking_lot::MutexGuard<'static, State>> {
+    match STATE.try_lock_for(STATE_LOCK_TIMEOUT) {
+        Some(guard) => Some(guard),
+        None => {
+            tracing::error!(
+                target: "platform",
+                "STATE lock timed out after {STATE_LOCK_TIMEOUT:?} in {caller} — \
+                 compositor is likely deadlocked; skipping this call"
+            );
+            None
+        }
+    }
+}
+
 /// Whether the main surface is currently gated. Takes the STATE lock, so
 /// callers must not already hold it (none do).
 pub(crate) fn gate_in_transition() -> bool {
-    STATE.lock().gate.in_transition()
+    match lock_state("gate_in_transition") {
+        Some(st) => st.gate.in_transition(),
+        None => false,
+    }
 }
 
 // =====================================================================
@@ -207,7 +238,10 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
 /// Release all surfaces + devices. Called from win_cleanup (C++) after the
 /// WndProc hook is unhooked and the input thread is joined.
 pub fn jfn_win_cleanup_compositor() {
-    let mut st = STATE.lock();
+    // Bounded: a wedged STATE must not block shutdown_runtime forever.
+    let Some(mut st) = lock_state("jfn_win_cleanup_compositor") else {
+        return;
+    };
     // Free any remaining surfaces. Browsers should normally free them
     // first, but be defensive.
     let live: Vec<*mut Surface> = st.surfaces.take_live();
@@ -351,6 +385,19 @@ fn recover_from_device_loss(st: &mut State) {
     tracing::info!(target: "platform", "compositor recovered from device loss");
 }
 
+/// Retries device-loss recovery if a previous attempt left `st.devices`
+/// empty. Without this, one failed `init_devices` inside
+/// `recover_from_device_loss` left the compositor permanently blind — every
+/// later paint call saw `devices == None` and just bailed out, with no
+/// further retry ever attempted. Cheap no-op once devices are present again;
+/// deliberately retries on every call while down rather than backing off,
+/// since device loss is rare and "stuck forever" was the worse failure mode.
+fn retry_recovery_if_needed(st: &mut State) {
+    if st.devices.is_none() {
+        recover_from_device_loss(st);
+    }
+}
+
 // =====================================================================
 // Swap-chain helpers (locked).
 // =====================================================================
@@ -393,7 +440,13 @@ fn create_swap_chain(
 }
 
 /// Ensure `sc` is sized (w,h); resize in place if possible, otherwise
-/// recreate and rebind to `visual`. Updates `sw`/`sh` on success.
+/// recreate and rebind to `visual`. Updates `sw`/`sh` on success. Returns
+/// `true` if a `ResizeBuffers` failure was confirmed to be a device
+/// removal/reset, so the caller (which holds `&mut State`) can run
+/// `recover_from_device_loss` — this function only has `&CompositorDevices`
+/// and previously discarded that result, so a device-removed swap-chain
+/// resize never triggered recovery when the subsequent recreate happened to
+/// succeed against the same (dead) device.
 fn ensure_swap_chain(
     devices: &CompositorDevices,
     sc: &mut Option<IDXGISwapChain1>,
@@ -402,13 +455,13 @@ fn ensure_swap_chain(
     visual: &IDCompositionVisual,
     w: i32,
     h: i32,
-) {
+) -> bool {
     if w <= 0 || h <= 0 {
-        return;
+        return false;
     }
     if let Some(existing) = sc.as_ref() {
         if *sw == w && *sh == h {
-            return;
+            return false;
         }
         let resize = unsafe {
             existing.ResizeBuffers(
@@ -419,21 +472,23 @@ fn ensure_swap_chain(
                 DXGI_SWAP_CHAIN_FLAG(0),
             )
         };
+        let mut device_lost = false;
         if let Err(e) = &resize {
             tracing::warn!(target: "platform", "ResizeBuffers failed, recreating swap chain: {e:?}");
-            // Recovery is wired at the call site with `&mut State` access
-            // (`win_surface_present`); here we can only flag it in the log.
-            let _ = device_removed(&devices.d3d_device);
+            device_lost = device_removed(&devices.d3d_device);
         }
         if resize.is_ok() {
             *sw = w;
             *sh = h;
-            return;
+            return false;
         }
         unsafe {
             let _ = visual.SetContent(None::<&windows_core::IUnknown>);
         }
         *sc = None;
+        if device_lost {
+            return true;
+        }
     }
 
     if let Some(new_sc) = create_swap_chain(devices, w, h) {
@@ -444,6 +499,7 @@ fn ensure_swap_chain(
         *sw = w;
         *sh = h;
     }
+    false
 }
 
 /// Logs whether the D3D device has been removed/reset and, if so, the
@@ -462,31 +518,171 @@ fn device_removed(device: &ID3D11Device1) -> bool {
     }
 }
 
-/// Returns `true` if the D3D device was confirmed removed/reset during this
-/// present attempt, so the caller can trigger `recover_from_device_loss`.
+/// Diagnostic-only probe: checks and logs the D3D device's removed/reset
+/// status right now, independent of any Present/GetBuffer failure. Unlike
+/// `device_removed`, this logs the not-removed case too, so it's useful
+/// called proactively (e.g. right on a WM_DISPLAYCHANGE hotplug event) to
+/// see device state at the moment of the event rather than only finding out
+/// reactively if/when a subsequent Present happens to fail. Does not trigger
+/// recovery itself — `present_to_swap_chain`'s own check still owns that.
+pub fn win_probe_device_removed_diagnostic() {
+    let Some(st) = lock_state("win_probe_device_removed_diagnostic") else {
+        return;
+    };
+    match st.devices.as_ref() {
+        Some(devices) => unsafe {
+            match devices.d3d_device.GetDeviceRemovedReason() {
+                Ok(()) => {
+                    tracing::info!(target: "platform", "device-removed probe: device alive");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "platform", "device-removed probe: device removed/reset, reason: {e:?}");
+                }
+            }
+        },
+        None => {
+            tracing::info!(target: "platform", "device-removed probe: no devices (compositor not initialized)");
+        }
+    }
+}
+
+/// Outcome of a single swap-chain present attempt.
+enum PresentOutcome {
+    Ok,
+    /// `Present`/`GetBuffer` failed but the device is still alive. Distinct
+    /// from `DeviceLost` because the old code collapsed this case into
+    /// "not lost" and callers then unconditionally reported success to CEF,
+    /// leaving a stale swap-chain/visual in service with no recovery and no
+    /// retry.
+    Failed,
+    /// The D3D device was confirmed removed/reset; caller should run
+    /// `recover_from_device_loss`.
+    DeviceLost,
+}
+
+/// Diagnostic-only: tracks accelerated-paint frames and the distinct CEF
+/// shared-texture handles seen, to correlate against the growing "Section"
+/// handle count Process Explorer showed during the 2026-07-16/17 overnight
+/// GPU shared-memory leak (see memory `project-jellyfin-windows-tv-hotplug`
+/// and `project-startup-window-mode`). If CEF is actually pooling/reusing a
+/// small rotating set of handles, `distinct_count` should plateau; if it
+/// climbs 1:1 with `frame_count`, CEF is never recycling and the leak is
+/// upstream of our code. Remove once the leak investigation concludes.
+struct AccelPaintDiag {
+    frame_count: u64,
+    distinct_count: u64,
+    recent_handles: Vec<isize>,
+}
+
+static ACCEL_PAINT_DIAG: Mutex<AccelPaintDiag> = Mutex::new(AccelPaintDiag {
+    frame_count: 0,
+    distinct_count: 0,
+    recent_handles: Vec::new(),
+});
+
+fn log_accel_paint_diag(tag: &str, handle: *mut c_void, w: i32, h: i32) {
+    let mut d = ACCEL_PAINT_DIAG.lock();
+    d.frame_count += 1;
+    let hv = handle as isize;
+    let is_new = !d.recent_handles.contains(&hv);
+    if is_new {
+        d.distinct_count += 1;
+        d.recent_handles.push(hv);
+        if d.recent_handles.len() > 8 {
+            d.recent_handles.remove(0);
+        }
+    }
+    if is_new || d.frame_count % 200 == 0 {
+        tracing::info!(
+            target: "platform",
+            "accel-paint diag[{tag}]: frame={} distinct_handles_seen={} new_handle={} handle={:?} {w}x{h}",
+            d.frame_count, d.distinct_count, is_new, handle
+        );
+    }
+}
+
+/// Diagnostic-only: blocks until the GPU has actually finished the work
+/// enqueued so far on this context (i.e. the preceding `CopyResource`),
+/// rather than just submitting it. CEF's docs say the shared-texture
+/// resource is "released to the underlying pool for reuse when the callback
+/// returns from client code" — `CopyResource` only enqueues a copy, it
+/// doesn't wait for it, so previously we could return from
+/// `OnAcceleratedPaint` before our read of the CEF-owned texture had
+/// actually completed on the GPU. This tests whether that gap is why CEF's
+/// pool isn't recycling handles. Bounded to 200ms so a real GPU hang doesn't
+/// turn into an unbounded stall on top of the existing STATE lock timeout.
+fn wait_for_copy_completion(devices: &CompositorDevices) {
+    unsafe {
+        let desc = D3D11_QUERY_DESC {
+            Query: D3D11_QUERY_EVENT,
+            MiscFlags: 0,
+        };
+        let mut query: Option<ID3D11Query> = None;
+        if let Err(e) = devices.d3d_device.CreateQuery(&desc, Some(&mut query)) {
+            tracing::warn!(target: "platform", "diagnostic: CreateQuery failed: {e:?}");
+            return;
+        }
+        let Some(query) = query else {
+            return;
+        };
+        devices.d3d_context.End(&query);
+        let start = std::time::Instant::now();
+        loop {
+            let mut done: i32 = 0;
+            let _ = devices.d3d_context.GetData(
+                &query,
+                Some(&mut done as *mut i32 as *mut c_void),
+                std::mem::size_of::<i32>() as u32,
+                0,
+            );
+            if done != 0 {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_millis(200) {
+                tracing::warn!(target: "platform", "diagnostic: copy-completion query timed out after 200ms");
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let waited = start.elapsed();
+        if waited > std::time::Duration::from_millis(1) {
+            tracing::info!(target: "platform", "diagnostic: copy completion took {waited:?}");
+        }
+    }
+}
+
 fn present_to_swap_chain(
     devices: &CompositorDevices,
     sc: &IDXGISwapChain1,
     src: &ID3D11Texture2D,
-) -> bool {
+) -> PresentOutcome {
     unsafe {
         match sc.GetBuffer::<ID3D11Texture2D>(0) {
             Ok(bb) => {
                 devices.d3d_context.CopyResource(&bb, src);
+                wait_for_copy_completion(devices);
                 let present_hr = sc.Present(0, DXGI_PRESENT(0));
-                let mut lost = false;
+                let mut outcome = PresentOutcome::Ok;
                 if present_hr.is_err() {
                     tracing::error!(target: "platform", "swap-chain Present failed: {present_hr:?}");
-                    lost = device_removed(&devices.d3d_device);
+                    outcome = if device_removed(&devices.d3d_device) {
+                        PresentOutcome::DeviceLost
+                    } else {
+                        PresentOutcome::Failed
+                    };
                 }
                 if let Err(e) = devices.dcomp_device.Commit() {
                     tracing::error!(target: "platform", "dcomp Commit failed after present: {e:?}");
                 }
-                lost
+                outcome
             }
             Err(e) => {
                 tracing::error!(target: "platform", "GetBuffer failed: {e:?}");
-                device_removed(&devices.d3d_device)
+                if device_removed(&devices.d3d_device) {
+                    PresentOutcome::DeviceLost
+                } else {
+                    PresentOutcome::Failed
+                }
             }
         }
     }
@@ -497,7 +693,9 @@ fn present_to_swap_chain(
 // =====================================================================
 
 pub fn win_alloc_surface() -> *mut c_void {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_alloc_surface") else {
+        return std::ptr::null_mut();
+    };
     let Some(devices) = st.devices.as_ref() else {
         return std::ptr::null_mut();
     };
@@ -546,7 +744,9 @@ pub fn win_free_surface(s: *mut c_void) {
     }
     let p = s as *mut Surface;
 
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_free_surface") else {
+        return;
+    };
     st.surfaces.remove(p);
 
     let devices = st.devices.as_ref();
@@ -565,7 +765,9 @@ pub fn win_free_surface(s: *mut c_void) {
 /// so they're not in this list.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn win_restack(ordered: *const *mut c_void, n: usize) {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_restack") else {
+        return;
+    };
     let Some(dcomp_root) = st.devices.as_ref().map(|d| d.dcomp_root.clone()) else {
         return;
     };
@@ -641,7 +843,10 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
         return false;
     }
 
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_surface_present") else {
+        return false;
+    };
+    retry_recovery_if_needed(&mut st);
     let Some(d3d_device) = st.devices.as_ref().map(|d| d.d3d_device.clone()) else {
         return false;
     };
@@ -696,7 +901,7 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     let Some(devices) = st.devices.as_ref() else {
         return false;
     };
-    ensure_swap_chain(
+    let resize_lost = ensure_swap_chain(
         devices,
         &mut surf.swap_chain,
         &mut surf.sw,
@@ -707,12 +912,22 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     );
     let sc = match surf.swap_chain.as_ref() {
         Some(sc) => sc.clone(),
-        None => return false,
+        None => {
+            if resize_lost {
+                recover_from_device_loss(&mut st);
+            }
+            return false;
+        }
     };
-    if present_to_swap_chain(devices, &sc, &src) {
-        recover_from_device_loss(&mut st);
+    log_accel_paint_diag("main", handle, w, h);
+    match present_to_swap_chain(devices, &sc, &src) {
+        PresentOutcome::DeviceLost => {
+            recover_from_device_loss(&mut st);
+            true
+        }
+        PresentOutcome::Ok => true,
+        PresentOutcome::Failed => false,
     }
-    true
 }
 
 pub fn win_surface_present_software(
@@ -727,7 +942,10 @@ pub fn win_surface_present_software(
         return false;
     }
 
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_surface_present_software") else {
+        return false;
+    };
+    retry_recovery_if_needed(&mut st);
     let p = s as *mut Surface;
     if st.surfaces.is_main(p) {
         match st.gate.main_present_decision((w, h)) {
@@ -782,7 +1000,7 @@ pub fn win_surface_present_software(
         Some(v) => v.clone(),
         None => return false,
     };
-    ensure_swap_chain(
+    let resize_lost = ensure_swap_chain(
         devices,
         &mut surf.swap_chain,
         &mut surf.sw,
@@ -793,19 +1011,30 @@ pub fn win_surface_present_software(
     );
     let sc = match surf.swap_chain.as_ref() {
         Some(sc) => sc.clone(),
-        None => return false,
+        None => {
+            if resize_lost {
+                recover_from_device_loss(&mut st);
+            }
+            return false;
+        }
     };
-    if present_to_swap_chain(devices, &sc, &src) {
-        recover_from_device_loss(&mut st);
+    match present_to_swap_chain(devices, &sc, &src) {
+        PresentOutcome::DeviceLost => {
+            recover_from_device_loss(&mut st);
+            true
+        }
+        PresentOutcome::Ok => true,
+        PresentOutcome::Failed => false,
     }
-    true
 }
 
 pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
     if s.is_null() || pw <= 0 || ph <= 0 {
         return;
     }
-    let st = STATE.lock();
+    let Some(mut st) = lock_state("win_surface_resize") else {
+        return;
+    };
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -822,7 +1051,7 @@ pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph:
         Some(v) => v.clone(),
         None => return,
     };
-    ensure_swap_chain(
+    let resize_lost = ensure_swap_chain(
         devices,
         &mut surf.swap_chain,
         &mut surf.sw,
@@ -834,13 +1063,18 @@ pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph:
     unsafe {
         let _ = devices.dcomp_device.Commit();
     }
+    if resize_lost {
+        recover_from_device_loss(&mut st);
+    }
 }
 
 pub fn win_surface_set_visible(s: *mut c_void, visible: bool) {
     if s.is_null() {
         return;
     }
-    let st = STATE.lock();
+    let Some(st) = lock_state("win_surface_set_visible") else {
+        return;
+    };
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -911,17 +1145,23 @@ fn end_transition_locked(st: &mut State) {
 /// `win_begin_transition_impl` C++ helper. Takes STATE lock then runs
 /// the locked routine.
 pub fn jfn_win_begin_transition_locked() {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("jfn_win_begin_transition_locked") else {
+        return;
+    };
     begin_transition_locked(&mut st);
 }
 
 pub fn win_end_transition() {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_end_transition") else {
+        return;
+    };
     end_transition_locked(&mut st);
 }
 
 pub fn win_set_expected_size(w: c_int, h: c_int) {
-    STATE.lock().gate.set_expected((w, h));
+    if let Some(mut st) = lock_state("win_set_expected_size") {
+        st.gate.set_expected((w, h));
+    }
 }
 
 // =====================================================================
@@ -934,7 +1174,9 @@ pub fn win_set_expected_size(w: c_int, h: c_int) {
 /// settled at its new size. `force_end` ends it even if the physical size is
 /// unchanged (a fullscreen-style edge that didn't alter the client size).
 pub fn jfn_win_update_surface_size(lw: c_int, lh: c_int, pw: c_int, ph: c_int, force_end: bool) {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("jfn_win_update_surface_size") else {
+        return;
+    };
     if st.gate.in_transition() {
         st.pending_lw = lw;
         st.pending_lh = lh;
@@ -950,12 +1192,16 @@ pub fn jfn_win_update_surface_size(lw: c_int, lh: c_int, pw: c_int, ph: c_int, f
 /// Called from C++ WndProc on WM_SIZE to run begin_transition under the
 /// state lock (matches the old win_begin_transition_locked behavior).
 pub fn jfn_win_wndproc_begin_transition_locked() {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("jfn_win_wndproc_begin_transition_locked") else {
+        return;
+    };
     begin_transition_locked(&mut st);
 }
 
 pub fn jfn_win_wndproc_end_transition_locked() {
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("jfn_win_wndproc_end_transition_locked") else {
+        return;
+    };
     end_transition_locked(&mut st);
 }
 
@@ -967,7 +1213,9 @@ pub fn win_popup_show(s: *mut c_void, x: c_int, y: c_int) {
     if s.is_null() {
         return;
     }
-    let _st = STATE.lock();
+    let Some(_st) = lock_state("win_popup_show") else {
+        return;
+    };
     let surf = unsafe { &mut *(s as *mut Surface) };
     surf.popup_visible = true;
     if let Some(pv) = surf.popup_visual.as_ref() {
@@ -983,7 +1231,9 @@ pub fn win_popup_hide(s: *mut c_void) {
     if s.is_null() {
         return;
     }
-    let st = STATE.lock();
+    let Some(st) = lock_state("win_popup_hide") else {
+        return;
+    };
     let surf = unsafe { &mut *(s as *mut Surface) };
     surf.popup_visible = false;
     let pv = match surf.popup_visual.as_ref() {
@@ -1012,7 +1262,10 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
     if handle.is_null() {
         return;
     }
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_popup_present") else {
+        return;
+    };
+    retry_recovery_if_needed(&mut st);
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -1041,7 +1294,7 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
         Some(v) => v.clone(),
         None => return,
     };
-    ensure_swap_chain(
+    let resize_lost = ensure_swap_chain(
         devices,
         &mut surf.popup_swap_chain,
         &mut surf.popup_sw,
@@ -1052,9 +1305,15 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
     );
     let sc = match surf.popup_swap_chain.as_ref() {
         Some(sc) => sc.clone(),
-        None => return,
+        None => {
+            if resize_lost {
+                recover_from_device_loss(&mut st);
+            }
+            return;
+        }
     };
-    if present_to_swap_chain(devices, &sc, &src) {
+    log_accel_paint_diag("popup", handle, w, h);
+    if let PresentOutcome::DeviceLost = present_to_swap_chain(devices, &sc, &src) {
         recover_from_device_loss(&mut st);
     }
 }
@@ -1070,7 +1329,10 @@ pub fn win_popup_present_software(
     if s.is_null() || buffer.is_null() || pw <= 0 || ph <= 0 {
         return;
     }
-    let mut st = STATE.lock();
+    let Some(mut st) = lock_state("win_popup_present_software") else {
+        return;
+    };
+    retry_recovery_if_needed(&mut st);
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -1118,7 +1380,7 @@ pub fn win_popup_present_software(
         None => return,
     };
 
-    ensure_swap_chain(
+    let resize_lost = ensure_swap_chain(
         devices,
         &mut surf.popup_swap_chain,
         &mut surf.popup_sw,
@@ -1129,9 +1391,14 @@ pub fn win_popup_present_software(
     );
     let sc = match surf.popup_swap_chain.as_ref() {
         Some(sc) => sc.clone(),
-        None => return,
+        None => {
+            if resize_lost {
+                recover_from_device_loss(&mut st);
+            }
+            return;
+        }
     };
-    if present_to_swap_chain(devices, &sc, &src) {
+    if let PresentOutcome::DeviceLost = present_to_swap_chain(devices, &sc, &src) {
         recover_from_device_loss(&mut st);
     }
 }

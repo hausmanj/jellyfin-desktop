@@ -368,6 +368,12 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                     focus_hwnd.0 as usize == input_hwnd_raw,
                 );
 
+                // Diagnostic: proactively check D3D device-removed status
+                // right at the display-change event, instead of only
+                // learning about it reactively if/when a Present happens to
+                // fail. See memory `project-jellyfin-windows-tv-hotplug`.
+                crate::compositor::win_probe_device_removed_diagnostic();
+
                 // Fix: hotplug-driven focus churn can leave the input child
                 // window without focus with nothing to re-assert it. Post a
                 // re-assert to the input thread on every event on this path;
