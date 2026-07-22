@@ -198,6 +198,11 @@ pub fn jfn_browsers_set_active(layer: *mut JfnCefLayer) {
     if !layer.is_null() {
         b.active_stack.push(layer);
         if let Some(h) = cursor_handle_of(layer) {
+            // Diagnostic-only: pairs with the `route_cursor` logging above —
+            // shows which layer's cursor baseline gets replayed on
+            // activation (Router::select), and whether that layer even has
+            // a cursor handle yet.
+            eprintln!("[cef] cursor: layer activated, selecting cursor handle={h:?}");
             b.cursor_router.select(h);
         }
     }
@@ -248,6 +253,17 @@ fn cursor_handle_of(layer: *mut JfnCefLayer) -> Option<Handle> {
 
 pub(crate) fn route_cursor(handle: Handle, shape: CursorShape) {
     if let Some(b) = INSTANCE.lock().as_mut() {
+        // Diagnostic-only: the 2026-07-16/17 "cursor invisible under a
+        // Jellyfin layer" investigation found the existing INFO logging
+        // never recorded cursor-shape changes or which layer they came
+        // from, so a static read of the routing code (Router in
+        // sink_routing.rs, WM_SETCURSOR handling in windows/src/input.rs)
+        // couldn't confirm or rule out a routing bug. This makes the next
+        // occurrence observable: was the shape applied (this producer was
+        // selected) or dropped (a background layer's stale `cursor: none`
+        // from jellyfin-web's video-idle CSS)?
+        let applied = b.cursor_router.current() == Some(handle);
+        eprintln!("[cef] cursor: handle={handle:?} shape={shape:?} applied={applied}");
         b.cursor_router.emit(handle, shape);
     }
 }

@@ -617,7 +617,14 @@ pub fn jfn_input_windows_set_cursor(t: c_int) {
         s.cursor_type = t;
         s.input_hwnd_raw
     };
+    // Diagnostic-only: see the matching comment on `route_cursor` in
+    // jfn_cef/src/browsers.rs — pairs the CEF-side emission with what
+    // actually reached this platform boundary, and flags the otherwise
+    // silent early-out when there's no input HWND yet to post to.
+    let shape = CursorShape::from_cef(t).unwrap_or(CursorShape::Pointer);
+    tracing::info!(target: "platform", "cursor: native set_cursor type={t} shape={shape:?} hwnd_raw={hwnd_raw:#x}");
     if hwnd_raw == 0 {
+        tracing::warn!(target: "platform", "cursor: dropped, no input hwnd yet");
         return;
     }
     let hwnd = HWND(hwnd_raw as *mut _);
