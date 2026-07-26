@@ -446,6 +446,10 @@ impl Platform for WindowsPlatform {
         win_set_fullscreen(v);
     }
 
+    fn on_window_handle_changed(&self, new_hwnd: i64) {
+        crate::platform::win_on_window_handle_changed(new_hwnd);
+    }
+
     fn toggle_fullscreen(&self) {
         win_toggle_fullscreen();
     }

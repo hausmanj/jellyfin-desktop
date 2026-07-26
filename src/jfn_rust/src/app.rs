@@ -488,6 +488,9 @@ fn start_playback_coordination() -> bool {
         tracing::info!(target: "Main", "MPV_EVENT_SHUTDOWN received");
         jfn_playback::jfn_shutdown_initiate();
     });
+    jfn_playback::ingest_driver::jfn_playback_set_window_handle_handler(|hwnd| {
+        plat().on_window_handle_changed(hwnd);
+    });
 
     tracing::info!(target: "Main", "[FLOW] starting Rust-owned mpv event thread");
     if !jfn_playback::ingest_driver::jfn_playback_start_mpv_event_thread() {

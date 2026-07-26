@@ -32,6 +32,11 @@ pub mod observe_id {
     pub const PAUSED_FOR_CACHE: u64 = 13;
     pub const CORE_IDLE: u64 = 14;
     pub const VIDEO_FRAME_INFO: u64 = 15;
+    /// mpv's native render-window handle. Observed (not sync-fetched)
+    /// so a mid-session VO recreate is caught asynchronously — see
+    /// `CLAUDE.md`: sync mpv property reads from an event callback
+    /// deadlock.
+    pub const WINDOW_ID: u64 = 16;
 }
 
 const MAX_BUFFERED_RANGES: usize = 8;
@@ -66,6 +71,12 @@ pub(crate) enum IngestOut {
     /// Terminal: libmpv has shut down. Caller breaks out of the event
     /// loop and triggers the rest of the app's teardown.
     Shutdown,
+    /// mpv's `window-id` property changed value — mpv tore down and
+    /// recreated its native render window (e.g. the VO reinit that
+    /// follows an `UPDATE_VO` option change like `d3d11-flip` on a live
+    /// VO). Carries the new raw window handle so platform code can
+    /// rebind native state to it.
+    WindowHandleChanged(i64),
 }
 
 /// Shared atomic cache mirroring the prior C++ `s_*` statics. Holds
@@ -264,6 +275,9 @@ fn digest_property<C: IngestCtx>(
             }
         }
         CACHE_STATE => digest_cache_state(value),
+        WINDOW_ID => as_int(value)
+            .map(|hwnd| vec![IngestOut::WindowHandleChanged(hwnd)])
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -342,6 +356,14 @@ fn as_flag(v: &PropertyValue) -> Option<bool> {
 fn as_double(v: &PropertyValue) -> Option<f64> {
     if let PropertyValue::Double(d) = v {
         Some(*d)
+    } else {
+        None
+    }
+}
+
+fn as_int(v: &PropertyValue) -> Option<i64> {
+    if let PropertyValue::Int(i) = v {
+        Some(*i)
     } else {
         None
     }

@@ -297,9 +297,34 @@ fn recover_from_device_loss(st: &mut State) {
         return;
     }
     tracing::warn!(target: "platform", "recovering compositor from GPU device loss");
+    rebuild_devices_and_visuals(st, st.hwnd);
+}
 
-    // Best-effort detach against the dying device — these COM calls may
-    // themselves fail since the device is already gone, which is fine.
+/// Rebind the compositor to a brand-new mpv HWND, e.g. after mpv tears
+/// down and recreates its own native render window (the VO recreate
+/// that follows an `UPDATE_VO` option change like `d3d11-flip` on a
+/// live VO). Unlike `jfn_win_init_compositor`, this always rebuilds —
+/// it must not be routed through that function's "already initialized"
+/// no-op guard, which would silently skip the rebind while claiming
+/// success.
+pub fn jfn_win_rebind_compositor_hwnd(new_hwnd: *mut c_void) {
+    let new_hwnd = HWND(new_hwnd);
+    let Some(mut st) = lock_state("jfn_win_rebind_compositor_hwnd") else {
+        return;
+    };
+    tracing::info!(target: "platform", "rebinding compositor to new mpv hwnd");
+    rebuild_devices_and_visuals(&mut st, new_hwnd);
+}
+
+/// Tear down and rebuild every D3D11/DComp device and re-create all
+/// existing surfaces' visuals in place, targeting `target_hwnd`. Shared
+/// by device-loss recovery (same hwnd as before) and hwnd-replacement
+/// rebind (a new hwnd) — both need identical surface/visual/z-order
+/// reconstruction; only the target window differs.
+fn rebuild_devices_and_visuals(st: &mut State, target_hwnd: HWND) {
+    // Best-effort detach against the dying/old device — these COM calls
+    // may themselves fail since the device may already be gone, which
+    // is fine.
     let live: Vec<*mut Surface> = st.surfaces.live().to_vec();
     for ptr in &live {
         if ptr.is_null() {
@@ -312,10 +337,11 @@ fn recover_from_device_loss(st: &mut State) {
     let prev_stack: Vec<*mut Surface> = st.surfaces.stack().to_vec();
 
     st.devices = None;
-    let devices = match init_devices(st.hwnd) {
+    st.hwnd = target_hwnd;
+    let devices = match init_devices(target_hwnd) {
         Ok(d) => d,
         Err(e) => {
-            tracing::error!(target: "platform", "device-loss recovery: init_devices failed: {e:?}");
+            tracing::error!(target: "platform", "rebuild_devices_and_visuals: init_devices failed: {e:?}");
             return;
         }
     };
@@ -366,10 +392,12 @@ fn recover_from_device_loss(st: &mut State) {
             let hr = if let Some(prev) = prev_visual.as_ref() {
                 devices.dcomp_root.AddVisual(visual, true, prev)
             } else {
-                devices.dcomp_root.AddVisual(visual, false, None::<&IDCompositionVisual>)
+                devices
+                    .dcomp_root
+                    .AddVisual(visual, false, None::<&IDCompositionVisual>)
             };
             if let Err(e) = hr {
-                tracing::error!(target: "platform", "device-loss recovery: restack AddVisual failed: {e:?}");
+                tracing::error!(target: "platform", "rebuild_devices_and_visuals: restack AddVisual failed: {e:?}");
                 continue;
             }
             s.in_tree = true;
@@ -382,7 +410,7 @@ fn recover_from_device_loss(st: &mut State) {
         let _ = devices.dcomp_device.Commit();
     }
     st.devices = Some(devices);
-    tracing::info!(target: "platform", "compositor recovered from device loss");
+    tracing::info!(target: "platform", "compositor devices/visuals rebuilt");
 }
 
 /// Retries device-loss recovery if a previous attempt left `st.devices`
@@ -592,7 +620,7 @@ fn log_accel_paint_diag(tag: &str, handle: *mut c_void, w: i32, h: i32) {
             d.recent_handles.remove(0);
         }
     }
-    if is_new || d.frame_count % 200 == 0 {
+    if is_new || d.frame_count.is_multiple_of(200) {
         tracing::info!(
             target: "platform",
             "accel-paint diag[{tag}]: frame={} distinct_handles_seen={} new_handle={} handle={:?} {w}x{h}",

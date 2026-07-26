@@ -368,6 +368,14 @@ pub trait Platform: Send + Sync {
     fn set_fullscreen(&self, _v: bool) {}
     fn toggle_fullscreen(&self) {}
 
+    /// mpv's `window-id` property changed. Fires once at startup with
+    /// the initial handle, then again only if mpv tears down and
+    /// recreates its native render window mid-session (e.g. the VO
+    /// reinit that follows an `UPDATE_VO` option change). Backends that
+    /// bind native window state to mpv's HWND once at init (Windows)
+    /// must rebind here on an actual change; others can ignore it.
+    fn on_window_handle_changed(&self, _new_hwnd: i64) {}
+
     // Window controls for client-side decorations. Default no-ops cover
     // backends without CSD (X11 WMs / macOS / Windows draw their own).
     fn window_minimize(&self) {}

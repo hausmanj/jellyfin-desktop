@@ -57,6 +57,13 @@ fn shutdown_flag() -> &'static AtomicBool {
     &FLAG
 }
 
+type WindowHandleCb = Box<dyn Fn(i64) + Send + Sync + 'static>;
+
+fn window_handle_slot() -> &'static parking_lot::Mutex<Option<WindowHandleCb>> {
+    static SLOT: OnceLock<parking_lot::Mutex<Option<WindowHandleCb>>> = OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
 // ---------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------
@@ -74,6 +81,11 @@ fn dispatch(outs: Vec<IngestOut>) -> u8 {
             IngestOut::Shutdown => {
                 shutdown_flag().store(true, Ordering::Release);
                 flags |= INGEST_FLAG_SHUTDOWN;
+            }
+            IngestOut::WindowHandleChanged(hwnd) => {
+                if let Some(cb) = window_handle_slot().lock().as_ref() {
+                    cb(hwnd);
+                }
             }
         }
     }
@@ -248,6 +260,7 @@ pub fn jfn_playback_observe_mpv_properties(backend: u8) -> bool {
             c"video-frame-info",
             mpv_format::MPV_FORMAT_NODE,
         ),
+        (WINDOW_ID, c"window-id", mpv_format::MPV_FORMAT_INT64),
     ];
 
     for &(id, name, fmt) in pairs {
@@ -348,6 +361,17 @@ pub fn jfn_playback_set_macos_logical_provider<
 /// Install the `MPV_EVENT_SHUTDOWN` handler.
 pub fn jfn_playback_set_shutdown_handler<F: Fn() + Send + Sync + 'static>(cb: F) {
     *shutdown_handler_slot().lock() = Some(Box::new(cb));
+}
+
+/// Install the `window-id` property-change handler. Fires whenever
+/// mpv's native render window is (re)created — including the VO
+/// recreate that follows an `UPDATE_VO` option change (e.g.
+/// `d3d11-flip`) on a live VO. The callback receives the new raw
+/// window handle and must compare it against whatever it already has
+/// bound; this fires once at startup (initial property delivery) in
+/// addition to any real mid-session recreate.
+pub fn jfn_playback_set_window_handle_handler<F: Fn(i64) + Send + Sync + 'static>(cb: F) {
+    *window_handle_slot().lock() = Some(Box::new(cb));
 }
 
 fn snapshot_scale() -> f32 {

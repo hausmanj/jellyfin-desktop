@@ -40,7 +40,7 @@ use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 // Input thread lives in `crate::input`.
 use crate::input::{
-    jfn_input_windows_get_hwnd, jfn_input_windows_reassert_focus,
+    jfn_input_windows_get_hwnd, jfn_input_windows_reassert_focus, jfn_input_windows_recreate,
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
     jfn_input_windows_stop_input_thread,
 };
@@ -450,6 +450,84 @@ pub fn win_init(_mpv: *mut c_void) -> bool {
 
     tracing::info!("Windows DirectComposition compositor initialized");
     true
+}
+
+/// mpv's `window-id` property changed. Fires once at startup with the
+/// initial handle — which already matches what `win_init` recorded
+/// moments earlier, so this becomes a cheap no-op — and again only if
+/// mpv tears down and recreates its own native render window
+/// mid-session (e.g. the VO reinit that follows an `UPDATE_VO` option
+/// change like `d3d11-flip` on a live VO). Delivered via mpv property
+/// observation, not a sync fetch: sync mpv reads from an event
+/// callback deadlock (see `CLAUDE.md`).
+///
+/// Everything Windows-side that was bound to mpv's HWND once at
+/// `win_init` and never revisited goes stale on a real change — the
+/// WndProc hook's target filter, the compositor's DirectComposition
+/// target, the input child window (destroyed by Windows as a side
+/// effect of its old parent's destruction), and the SMTC binding — so
+/// all four are rebound here.
+pub fn win_on_window_handle_changed(new_wid: i64) {
+    if new_wid <= 0 {
+        return;
+    }
+    let new_hwnd_raw = new_wid as usize;
+    let old_hwnd_raw = STATE.lock().mpv_hwnd_raw;
+    if new_hwnd_raw == old_hwnd_raw {
+        return;
+    }
+    tracing::warn!(
+        "mpv window handle changed ({old_hwnd_raw:#x} -> {new_hwnd_raw:#x}) — mpv recreated \
+         its native window; rebinding compositor, input, wndproc hook, and SMTC"
+    );
+
+    let new_hwnd = hwnd_from_raw(new_hwnd_raw);
+    STATE.lock().mpv_hwnd_raw = new_hwnd_raw;
+
+    // Re-enable DWM transparency for the new window so DComp visuals
+    // with premultiplied alpha still work (mirrors win_init).
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    unsafe {
+        let _ = DwmExtendFrameIntoClientArea(new_hwnd, &margins);
+    }
+
+    // Seed was_fullscreen against the new window so the first WM_SIZE
+    // doesn't start a spurious transition (mirrors win_init).
+    {
+        let style = unsafe { GetWindowLongPtrW(new_hwnd, GWL_STYLE) };
+        STATE.lock().was_fullscreen = is_fullscreen_style(style);
+    }
+
+    // Reinstall the WndProc hook against the new window/thread — don't
+    // assume the thread mpv creates its next window on is unchanged.
+    let old_hook_raw = STATE.lock().wndproc_hook_raw;
+    if old_hook_raw != 0 {
+        let hook = HHOOK(old_hook_raw as *mut c_void);
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+        STATE.lock().wndproc_hook_raw = 0;
+    }
+    let mpv_tid = unsafe { GetWindowThreadProcessId(new_hwnd, None) };
+    let hook =
+        unsafe { SetWindowsHookExW(WH_CALLWNDPROCRET, Some(mpv_wndproc_hook), None, mpv_tid) };
+    match hook {
+        Ok(h) => STATE.lock().wndproc_hook_raw = h.0 as usize,
+        Err(e) => tracing::error!("SetWindowsHookExW(WH_CALLWNDPROCRET) reinstall failed: {e:?}"),
+    }
+
+    crate::compositor::jfn_win_rebind_compositor_hwnd(new_hwnd_raw as *mut c_void);
+    jfn_input_windows_recreate(new_hwnd_raw);
+
+    jfn_windows_sink::jfn_windows_sink_stop();
+    jfn_windows_sink::jfn_windows_sink_start_for(new_hwnd_raw as isize);
+
+    tracing::info!("mpv window handle rebind complete");
 }
 
 pub fn win_cleanup() {
