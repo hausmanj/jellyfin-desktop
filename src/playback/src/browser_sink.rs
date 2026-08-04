@@ -43,6 +43,21 @@ pub fn jfn_playback_set_browsers_refresh_rate_handler(cb: Option<SetHzCb>) {
 // main can read it after coordinator shutdown without keeping coord alive.
 static WAS_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
+/// CEF `windowless_frame_rate` used while fullscreen video is playing. The
+/// browser UI overlay renders transparently on top of mpv's own video
+/// surface in this state (subtitles are drawn natively by mpv, not by the
+/// web layer — see memory `project-jellyfin-windows-tv-hotplug`), so it has
+/// nothing that needs sub-frame-accurate updates; it only needs to still
+/// redraw occasionally so OSD controls remain responsive when the user
+/// moves the mouse. Confirmed real leak (Windows RADAR + a `distinct_
+/// handles_seen` diagnostic in `compositor.rs`) showed CEF minting a new
+/// accelerated-paint shared-texture handle on almost every frame at the
+/// full ~60Hz rate, continuously, for the entire time video was fullscreen
+/// — this caps the churn rate without ever fully stopping painting (unlike
+/// `WasHidden`, which has no "wake back up on mouse move" hook wired up
+/// yet and risks leaving the OSD permanently invisible if that's missed).
+const FULLSCREEN_PAINT_THROTTLE_HZ: f64 = 10.0;
+
 /// Geometry-save tail reads this at shutdown.
 pub fn jfn_playback_was_maximized_before_fullscreen() -> bool {
     WAS_MAXIMIZED.load(Ordering::Relaxed)
@@ -96,6 +111,20 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
                 "window._nativeFullscreenChanged({})",
                 if snap.fullscreen { "true" } else { "false" }
             ));
+            // Throttle (not stop) CEF's paint rate while fullscreen video
+            // covers the UI, and restore the real display rate on exit.
+            // Reuses the same `set_hz` slot/handler as DisplayHzChanged
+            // below — same mechanism, just also driven by fullscreen state.
+            if let Some(cb) = slot().lock().set_hz {
+                let hz = if snap.fullscreen {
+                    FULLSCREEN_PAINT_THROTTLE_HZ
+                } else if snap.display_hz > 0.0 {
+                    snap.display_hz
+                } else {
+                    60.0
+                };
+                cb(hz);
+            }
         }
         PlaybackEventKind::OsdDimsChanged => {
             if let Some(cb) = slot().lock().set_size {
