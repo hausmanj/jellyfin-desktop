@@ -28,13 +28,21 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
+    DXGI_ERROR_NOT_FOUND, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_PRESENT,
+    DXGI_QUERY_VIDEO_MEMORY_INFO, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter,
+    IDXGIAdapter3, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGIOutput6, IDXGISwapChain1,
 };
+use windows::Win32::Graphics::Gdi::{
+    DEVMODEW, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS, EnumDisplaySettingsExW,
+    HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+};
+use windows::core::PCWSTR;
 use windows_core::Interface;
 
 use jfn_compositor_core::stack::SurfaceStack;
 use jfn_compositor_core::transition::{PresentDecision, TransitionGate};
+use jfn_mpv::api::{jfn_mpv_free_string, jfn_mpv_get_property_string};
 use jfn_platform_abi::JfnRect;
 
 // =====================================================================
@@ -85,6 +93,13 @@ struct CompositorDevices {
     d3d_device: ID3D11Device1,
     d3d_context: ID3D11DeviceContext,
     dxgi_factory: IDXGIFactory2,
+    // None on adapters that don't expose IDXGIAdapter3 (pre-Windows 8.1
+    // drivers) — VRAM instrumentation is best-effort, never load-bearing.
+    adapter3: Option<IDXGIAdapter3>,
+    // The mpv render window this instance was built for — used only to
+    // resolve which physical output/monitor to query for its actual DXGI
+    // color-space state (diagnostic, see `log_output_colorspace`).
+    hwnd: HWND,
     dcomp_device: IDCompositionDevice,
     // Held only to keep the composition target (and its bound root) alive for
     // the lifetime of the compositor; never read after construction.
@@ -216,6 +231,7 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
         let dxgi_device: IDXGIDevice = d3d_device.cast()?;
         let adapter: IDXGIAdapter = dxgi_device.GetAdapter()?;
         let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
+        let adapter3: Option<IDXGIAdapter3> = adapter.cast().ok();
 
         // DComp device on the DXGI device.
         let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
@@ -228,6 +244,8 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
             d3d_device,
             d3d_context: context,
             dxgi_factory,
+            adapter3,
+            hwnd,
             dcomp_device,
             dcomp_target,
             dcomp_root,
@@ -297,7 +315,24 @@ fn recover_from_device_loss(st: &mut State) {
         return;
     }
     tracing::warn!(target: "platform", "recovering compositor from GPU device loss");
+    if let Some(devices) = st.devices.as_ref() {
+        log_vram_usage(devices, "pre-recovery");
+    }
     rebuild_devices_and_visuals(st, st.hwnd);
+}
+
+/// Diagnostic hook for the "Dolby Vision sticks on in fullscreen"
+/// investigation — logs the actual DXGI output color space at a named
+/// moment (e.g. immediately before/after a fullscreen toggle), so a stuck
+/// transition can be correlated against what the OS/driver actually had
+/// bound to the output at that instant. See `log_output_colorspace`.
+pub fn jfn_win_log_output_colorspace(context: &str) {
+    let Some(st) = lock_state("jfn_win_log_output_colorspace") else {
+        return;
+    };
+    if let Some(devices) = st.devices.as_ref() {
+        log_output_colorspace(devices, context);
+    }
 }
 
 /// Rebind the compositor to a brand-new mpv HWND, e.g. after mpv tears
@@ -461,6 +496,7 @@ fn create_swap_chain(
             Ok(sc) => Some(sc),
             Err(e) => {
                 tracing::error!(target: "platform", "CreateSwapChainForComposition failed: {e:?}");
+                log_vram_usage(devices, "CreateSwapChainForComposition-failed");
                 None
             }
         }
@@ -600,15 +636,24 @@ struct AccelPaintDiag {
     frame_count: u64,
     distinct_count: u64,
     recent_handles: Vec<isize>,
+    /// `distinct_count`/wall-clock time as of the last periodic tick — lets
+    /// the periodic log report a *rate* (new handles/sec) instead of only
+    /// a cumulative total, so a mitigation like the fullscreen paint
+    /// throttle (`browser_sink.rs`) can be checked for whether it actually
+    /// slows the leak, not just inspected once at the end of a long session.
+    last_periodic_distinct_count: u64,
+    last_periodic_at: Option<std::time::Instant>,
 }
 
 static ACCEL_PAINT_DIAG: Mutex<AccelPaintDiag> = Mutex::new(AccelPaintDiag {
     frame_count: 0,
     distinct_count: 0,
     recent_handles: Vec::new(),
+    last_periodic_distinct_count: 0,
+    last_periodic_at: None,
 });
 
-fn log_accel_paint_diag(tag: &str, handle: *mut c_void, w: i32, h: i32) {
+fn log_accel_paint_diag(devices: &CompositorDevices, tag: &str, handle: *mut c_void, w: i32, h: i32) {
     let mut d = ACCEL_PAINT_DIAG.lock();
     d.frame_count += 1;
     let hv = handle as isize;
@@ -620,12 +665,39 @@ fn log_accel_paint_diag(tag: &str, handle: *mut c_void, w: i32, h: i32) {
             d.recent_handles.remove(0);
         }
     }
-    if is_new || d.frame_count.is_multiple_of(200) {
+    let periodic = d.frame_count.is_multiple_of(200);
+    if is_new || periodic {
         tracing::info!(
             target: "platform",
             "accel-paint diag[{tag}]: frame={} distinct_handles_seen={} new_handle={} handle={:?} {w}x{h}",
             d.frame_count, d.distinct_count, is_new, handle
         );
+    }
+    // Sampled on the same periodic cadence, not on every new-handle event —
+    // distinct_handles_seen (above) is a crude 8-entry-window heuristic that
+    // can't distinguish a real leak from a larger legitimate CEF pool; this
+    // is the ground truth to correlate it against.
+    if periodic {
+        let now = std::time::Instant::now();
+        let rate_per_sec = d.last_periodic_at.map(|prev| {
+            let elapsed = now.duration_since(prev).as_secs_f64();
+            let new_handles = d.distinct_count - d.last_periodic_distinct_count;
+            if elapsed > 0.0 {
+                new_handles as f64 / elapsed
+            } else {
+                0.0
+            }
+        });
+        d.last_periodic_distinct_count = d.distinct_count;
+        d.last_periodic_at = Some(now);
+        tracing::info!(
+            target: "platform",
+            "accel-paint diag[{tag}]: distinct_handles_growth_rate={rate_per_sec:?} handles/sec (since last periodic log)"
+        );
+        drop(d);
+        let ctx = format!("periodic[{tag}]");
+        log_vram_usage(devices, &ctx);
+        log_output_colorspace(devices, &ctx);
     }
 }
 
@@ -679,6 +751,146 @@ fn wait_for_copy_completion(devices: &CompositorDevices) {
     }
 }
 
+/// Best-effort sync read of an mpv string property (mpv's client API
+/// stringifies any property type on request, so this works for the
+/// yes/no-flag properties read below too). Only call this from an explicit
+/// Rust->mpv API call site like this module's diagnostics (driven by user
+/// input / CEF paint callbacks) — NOT from mpv's own event-callback thread,
+/// which would deadlock on a sync property read (see `ingest.rs`'s
+/// `WINDOW_ID` doc comment / `CLAUDE.md`).
+fn read_mpv_property_string(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let ptr = unsafe { jfn_mpv_get_property_string(cname.as_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { jfn_mpv_free_string(ptr) };
+    Some(s)
+}
+
+/// Ground-truth resolution + refresh rate for a GDI display device, read
+/// independently of mpv's own `display-fps` detection — which the "32 Hz"
+/// bug (see memory `project-fullscreen-dv-fix`) proved can silently report
+/// a fallback/garbage value when mpv itself fails to determine the real
+/// mode (logged upstream as "Couldn't determine monitor refresh rate").
+/// Having our own reading lets us tell a genuine HDMI mode-switch apart
+/// from mpv/Windows software noise not matching physical reality.
+fn read_actual_output_mode(device_name: &[u16; 32]) -> Option<(u32, u32, u32)> {
+    let mut mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        EnumDisplaySettingsExW(
+            PCWSTR(device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut mode,
+            ENUM_DISPLAY_SETTINGS_FLAGS(0),
+        )
+    };
+    ok.as_bool()
+        .then_some((mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency))
+}
+
+/// Diagnostic for the "Dolby Vision sticks on in fullscreen" investigation:
+/// reads back the *actual* DXGI color space DWM currently has bound to the
+/// physical output our window is on, independent of what mpv/libplacebo
+/// thinks it last requested via `target-colorspace-hint`
+/// (`dv-detect.lua` -> `vo_gpu_next.c`'s `set_colorspace_hint`, which calls
+/// `pl_swapchain_colorspace_hint` unconditionally on every DV<->non-DV
+/// transition — that call site looks correct by inspection, so this exists
+/// to tell us whether our request is actually reaching/sticking on the
+/// output, or whether the OS/driver's own fullscreen HDR handling is
+/// overriding or not re-evaluating it (which by design this app cannot
+/// directly control). Best-effort: only handles the single/primary-output
+/// case, matched against the monitor our own window is currently on.
+///
+/// Also logs mpv's own current `target-colorspace-hint`/`d3d11-flip`
+/// values and the actual GDI display mode in the *same* line, so a single
+/// `colorspace[...]` line shows "what the app currently intends" alongside
+/// "what DXGI/Windows actually has bound" — no more cross-referencing two
+/// separately-timestamped log lines by hand to check whether they agree.
+fn log_output_colorspace(devices: &CompositorDevices, context: &str) {
+    let Some(adapter3) = devices.adapter3.as_ref() else {
+        return;
+    };
+    let target_monitor: HMONITOR =
+        unsafe { MonitorFromWindow(devices.hwnd, MONITOR_DEFAULTTONEAREST) };
+    let colorspace_hint =
+        read_mpv_property_string("target-colorspace-hint").unwrap_or_else(|| "?".into());
+    let d3d11_flip = read_mpv_property_string("d3d11-flip").unwrap_or_else(|| "?".into());
+    let mut i = 0u32;
+    loop {
+        let output: IDXGIOutput = match unsafe { adapter3.EnumOutputs(i) } {
+            Ok(o) => o,
+            Err(e) => {
+                if e.code() != DXGI_ERROR_NOT_FOUND {
+                    tracing::warn!(target: "platform", "colorspace[{context}]: EnumOutputs({i}) failed: {e:?}");
+                }
+                return;
+            }
+        };
+        i += 1;
+        let desc = match unsafe { output.GetDesc() } {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if desc.Monitor != target_monitor {
+            continue;
+        }
+        let mode = read_actual_output_mode(&desc.DeviceName);
+        let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+            return;
+        };
+        match unsafe { output6.GetDesc1() } {
+            Ok(desc1) => {
+                tracing::info!(
+                    target: "platform",
+                    "colorspace[{context}]: color_space={:?} bits_per_color={} \
+                     mpv[target-colorspace-hint={colorspace_hint} d3d11-flip={d3d11_flip}] \
+                     actual_mode={mode:?}",
+                    desc1.ColorSpace, desc1.BitsPerColor,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(target: "platform", "colorspace[{context}]: GetDesc1 failed: {e:?}");
+            }
+        }
+        return;
+    }
+}
+
+/// Ground-truth GPU memory usage (as opposed to the `distinct_handles_seen`
+/// heuristic in `log_accel_paint_diag`, which only dedupes against the last
+/// 8 handles and can't tell a real leak from a larger legitimate CEF pool).
+/// Cheap (a single driver query, no allocation) — safe to call on every
+/// present/texture failure plus periodically during steady state, so a VRAM
+/// exhaustion event (`E_OUTOFMEMORY` in either our compositor or mpv's
+/// separate D3D11 device) can be correlated against actual adapter budget
+/// numbers instead of inferred from symptoms.
+fn log_vram_usage(devices: &CompositorDevices, context: &str) {
+    let Some(adapter3) = devices.adapter3.as_ref() else {
+        return;
+    };
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    let hr = unsafe { adapter3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) };
+    if let Err(e) = hr {
+        tracing::warn!(target: "platform", "vram[{context}]: QueryVideoMemoryInfo failed: {e:?}");
+        return;
+    }
+    let usage_mb = info.CurrentUsage / (1024 * 1024);
+    let budget_mb = info.Budget / (1024 * 1024);
+    tracing::info!(
+        target: "platform",
+        "vram[{context}]: usage={usage_mb}MB budget={budget_mb}MB reservation={}MB available_for_reservation={}MB",
+        info.CurrentReservation / (1024 * 1024),
+        info.AvailableForReservation / (1024 * 1024),
+    );
+}
+
 fn present_to_swap_chain(
     devices: &CompositorDevices,
     sc: &IDXGISwapChain1,
@@ -693,6 +905,7 @@ fn present_to_swap_chain(
                 let mut outcome = PresentOutcome::Ok;
                 if present_hr.is_err() {
                     tracing::error!(target: "platform", "swap-chain Present failed: {present_hr:?}");
+                    log_vram_usage(devices, "Present-failed");
                     outcome = if device_removed(&devices.d3d_device) {
                         PresentOutcome::DeviceLost
                     } else {
@@ -706,6 +919,7 @@ fn present_to_swap_chain(
             }
             Err(e) => {
                 tracing::error!(target: "platform", "GetBuffer failed: {e:?}");
+                log_vram_usage(devices, "GetBuffer-failed");
                 if device_removed(&devices.d3d_device) {
                     PresentOutcome::DeviceLost
                 } else {
@@ -883,6 +1097,9 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(target: "platform", "OpenSharedResource1 failed: {e:?}");
+                if let Some(devices) = st.devices.as_ref() {
+                    log_vram_usage(devices, "OpenSharedResource1-main-failed");
+                }
                 return false;
             }
         }
@@ -947,7 +1164,7 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
             return false;
         }
     };
-    log_accel_paint_diag("main", handle, w, h);
+    log_accel_paint_diag(devices, "main", handle, w, h);
     match present_to_swap_chain(devices, &sc, &src) {
         PresentOutcome::DeviceLost => {
             recover_from_device_loss(&mut st);
@@ -1304,7 +1521,11 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
             .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle))
         {
             Ok(t) => t,
-            Err(_) => return,
+            Err(e) => {
+                tracing::error!(target: "platform", "OpenSharedResource1 failed (popup): {e:?}");
+                log_vram_usage(devices, "OpenSharedResource1-popup-failed");
+                return;
+            }
         }
     };
     let mut td = D3D11_TEXTURE2D_DESC::default();
@@ -1340,7 +1561,7 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
             return;
         }
     };
-    log_accel_paint_diag("popup", handle, w, h);
+    log_accel_paint_diag(devices, "popup", handle, w, h);
     if let PresentOutcome::DeviceLost = present_to_swap_chain(devices, &sc, &src) {
         recover_from_device_loss(&mut st);
     }
