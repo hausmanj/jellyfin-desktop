@@ -123,6 +123,11 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
                 } else {
                     60.0
                 };
+                tracing::info!(
+                    target: "playback",
+                    "fullscreen-paint-throttle: fullscreen={} -> cef windowless_frame_rate={hz} Hz",
+                    snap.fullscreen
+                );
                 cb(hz);
             }
         }

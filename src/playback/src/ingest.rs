@@ -295,6 +295,11 @@ fn digest_property<C: IngestCtx>(
                 // change happens to arrive and correct it, which could be
                 // never for the rest of the session. Keep the last known-
                 // good value instead of trusting an implausible one.
+                tracing::warn!(
+                    target: "playback",
+                    "rejected implausible display-fps reading: {fps} Hz (kept {} Hz)",
+                    state.display_hz()
+                );
                 return Vec::new();
             }
             if fps != state.display_hz() {
