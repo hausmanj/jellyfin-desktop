@@ -198,6 +198,25 @@ fn end_file_input(reason: &jfn_mpv::EndFileReason) -> Input {
     }
 }
 
+/// Common real-world display refresh rates (integer and NTSC-derived
+/// families). `display-fps` readings are checked against this list with a
+/// small tolerance rather than just a broad `0.0..300.0` sanity range,
+/// because the bogus values observed in the field (e.g. `32`) fall well
+/// within any such broad range but don't match any rate a real display
+/// actually uses.
+const KNOWN_REFRESH_RATES_HZ: &[f64] = &[
+    23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0, 50.0, 59.94, 60.0, 75.0, 90.0, 100.0, 119.88,
+    120.0, 144.0, 165.0, 180.0, 200.0, 240.0,
+];
+
+fn is_plausible_refresh_rate(fps: f64) -> bool {
+    const TOLERANCE_HZ: f64 = 0.06;
+    fps.is_finite()
+        && KNOWN_REFRESH_RATES_HZ
+            .iter()
+            .any(|known| (fps - known).abs() <= TOLERANCE_HZ)
+}
+
 fn digest_property<C: IngestCtx>(
     id: ObserveId,
     value: &PropertyValue,
@@ -265,6 +284,19 @@ fn digest_property<C: IngestCtx>(
             let Some(fps) = as_double(value) else {
                 return Vec::new();
             };
+            if !is_plausible_refresh_rate(fps) {
+                // mpv reports a fallback/garbage value here when it can't
+                // actually read the monitor's mode (logged upstream as
+                // "Couldn't determine monitor refresh rate") — observed in
+                // the field as e.g. `32`, which isn't a real display rate.
+                // Propagating it would silently mis-pace every CEF layer's
+                // `windowless_frame_rate` (via `Input::DisplayHz` ->
+                // `jfn_browsers_set_refresh_rate`) until the next *real*
+                // change happens to arrive and correct it, which could be
+                // never for the rest of the session. Keep the last known-
+                // good value instead of trusting an implausible one.
+                return Vec::new();
+            }
             if fps != state.display_hz() {
                 state
                     .display_hz_bits
@@ -490,6 +522,28 @@ mod tests {
         assert_eq!(state.display_hz(), 60.0);
         let out = ingest(&prop(observe_id::DISPLAY_FPS, v), &state, &ctx(1.0));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn display_fps_rejects_implausible_reading() {
+        // Field-observed bogus value (mpv's own fallback when it can't
+        // determine the monitor's real refresh rate) — must not overwrite
+        // a previously-good reading or propagate to CEF's frame pacing.
+        let state = IngestState::new();
+        let good = ingest(
+            &prop(observe_id::DISPLAY_FPS, PropertyValue::Double(60.0)),
+            &state,
+            &ctx(1.0),
+        );
+        assert!(matches!(good[0], IngestOut::Input(Input::DisplayHz(hz)) if hz == 60.0));
+
+        let bogus = ingest(
+            &prop(observe_id::DISPLAY_FPS, PropertyValue::Double(32.0)),
+            &state,
+            &ctx(1.0),
+        );
+        assert!(bogus.is_empty());
+        assert_eq!(state.display_hz(), 60.0);
     }
 
     #[test]
