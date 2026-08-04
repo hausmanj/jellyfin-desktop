@@ -74,6 +74,24 @@ mod single_instance {
             )
         };
         if pipe == INVALID_HANDLE_VALUE {
+            // Diagnostic for the "two live jellyfin-desktop.exe processes at
+            // once" finding (2026-08-01/02 crash investigation, see memory
+            // `project-fullscreen-dv-fix`): this is the exact branch that
+            // lets a second launch proceed as if no instance were running.
+            // A healthy prior instance always has its named-pipe server
+            // side open (`listener_loop` below), so landing here means
+            // either genuinely no instance is running, OR a prior
+            // instance's listener thread already died (see the
+            // `CreateNamedPipeA` failure log in `listener_loop` — that
+            // path breaks the loop silently with no retry). This log
+            // can't tell those two cases apart by itself, but it gives a
+            // timestamp to correlate against a `CreateNamedPipeA failed`
+            // line from an still-running earlier process's log, if one
+            // exists.
+            tracing::info!(
+                target: "platform",
+                "single-instance: no existing instance found (pipe connect failed) — proceeding as a new instance"
+            );
             return false;
         }
         let msg = b"raise\n";
@@ -108,6 +126,22 @@ mod single_instance {
                 )
             };
             if pipe == INVALID_HANDLE_VALUE {
+                // This silently ends the single-instance gate for the rest
+                // of the process's life — from this point on, a second
+                // launch's `try_signal_existing` will find nothing to
+                // connect to and proceed as a brand-new instance, even
+                // though this one is still very much alive. Logged (this
+                // branch previously had zero diagnostics) because
+                // `CreateNamedPipeA` failing is exactly the kind of thing
+                // that can happen under the resource exhaustion already
+                // confirmed via Windows RADAR (see memory
+                // `project-fullscreen-dv-fix`) — a plausible mechanism for
+                // the "two live processes at once" finding from the
+                // 2026-08-01/02 crash dumps.
+                tracing::warn!(
+                    target: "platform",
+                    "single-instance: CreateNamedPipeA failed — listener thread exiting, this instance is no longer discoverable by future launches"
+                );
                 break;
             }
 
@@ -159,8 +193,10 @@ mod single_instance {
         }
         let event = unsafe { CreateEventA(std::ptr::null(), 1, 0, std::ptr::null()) };
         if event.is_null() {
+            tracing::warn!(target: "platform", "single-instance: listener CreateEventA failed, gate not installed");
             return false;
         }
+        tracing::info!(target: "platform", "single-instance: listener started");
         SHUTDOWN_EVENT.store(event as usize, Ordering::Release);
         RUNNING.store(true, Ordering::Release);
         let id = instance_id.to_owned();
