@@ -67,6 +67,14 @@
 -- since mpv's track-list reports every track as unselected at the point
 -- this runs (see classify()), so there is no reliable "selected" signal
 -- available yet to narrow this further.
+--
+-- A DV->non-DV transition in fullscreen can leave the display stuck
+-- showing DV even though the properties above are correctly reasserted to
+-- non-DV (confirmed 2026-08-04/05, deterministic on G5 — see
+-- kick_fullscreen_to_clear_stuck_dv below and memory
+-- `project-fullscreen-dv-fix`). That's believed to be DWM not
+-- re-evaluating its automatic DV engagement just because mpv's swapchain
+-- changed, not anything wrong in this script's own logic.
 
 if mp.get_property("platform") ~= "windows" then
     return
@@ -131,10 +139,40 @@ local applied_path = nil
 -- profile changed. Keying on path too means a genuinely different piece
 -- of content is never silently trusted to already match just because some
 -- other file recently requested the same profile.
+-- 2026-08-04/05 finding, confirmed deterministic on G5: a DV file followed
+-- by a non-DV file in fullscreen leaves the TV stuck showing DV 100% of
+-- the time, even though target-colorspace-hint/d3d11-flip are correctly
+-- reasserted to "default" (confirmed via `colorspace[...]` diagnostic
+-- logging in compositor.rs — mpv's own recorded state matches what was
+-- requested; the mismatch is downstream, presumably DWM not re-evaluating
+-- its automatic DV engagement for the output just because mpv's own
+-- swapchain changed). User independently confirmed, before this fix
+-- existed, that manually toggling out of fullscreen and back always
+-- clears it — this kicks that same real toggle automatically so nobody
+-- has to do it by hand. Deferred a beat after the profile write so it
+-- doesn't race the VO tear-down/recreate that d3d11-flip's own change
+-- already triggers (see module header comment + platform.rs
+-- win_on_window_handle_changed) — that recreate needs to settle and get
+-- rebound on the Rust side first.
+local FULLSCREEN_KICK_DELAY_SECONDS = 1.0
+local FULLSCREEN_KICK_REENTER_DELAY_SECONDS = 0.35
+
+local function kick_fullscreen_to_clear_stuck_dv()
+    if not mp.get_property_native("fullscreen", false) then
+        return
+    end
+    mp.msg.info("[dv-detect] DV->non-DV transition while fullscreen: cycling fullscreen to clear a possibly-stuck DV output state")
+    mp.set_property_native("fullscreen", false)
+    mp.add_timeout(FULLSCREEN_KICK_REENTER_DELAY_SECONDS, function()
+        mp.set_property_native("fullscreen", true)
+    end)
+end
+
 local function apply_profile(name, path)
     if name == applied_profile and path == applied_path then
         return
     end
+    local previous_profile = applied_profile
     applied_profile = name
     applied_path = path
 
@@ -144,6 +182,10 @@ local function apply_profile(name, path)
     mp.msg.info(string.format(
         "[dv-detect] presentation profile -> %s (target-colorspace-hint=%s d3d11-flip=%s)",
         name, profile.hint, profile.flip))
+
+    if previous_profile == "dolby_vision" and name == "default" then
+        mp.add_timeout(FULLSCREEN_KICK_DELAY_SECONDS, kick_fullscreen_to_clear_stuck_dv)
+    end
 end
 
 mp.add_hook("on_preloaded", 50, function()
