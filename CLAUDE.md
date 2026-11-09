@@ -1,44 +1,53 @@
-# Project Notes
+@AGENTS.md
 
-## Constraints
-- **No hand-rolled JSON** — never manually construct or parse JSON with string concatenation, manual escaping, or homebrew parsers. Always use a proper JSON library or API (e.g. CEF's `CefParseJSON`/`CefWriteJSON`, or a vendored library if CEF isn't available in that context).
-- **No artificial heartbeats/polling** - event-driven architecture only. Never use timeouts as a workaround for proper event integration. No arbitrary timeout-based bailouts in shutdown paths either — fix the root cause instead.
-- **No texture stretching during resize** - CEF content must always render at 1:1 pixel mapping. Never scale/stretch textures to fill the viewport. Gaps from stale texture sizes are acceptable; stretching is not.
-- **No force pushing shared branches** — never use `git push --force` on any branch. `--force-with-lease` is only permitted on your own single-session branches and only after explicitly confirming with the user that no other session has pushed to that branch. When in doubt, fetch first and rebase locally.
+# Hausflix Desktop (personal build)
 
-## Build / Run
-All app code is Rust; the cargo workspace lives in `src/` and produces the `jellyfin-desktop` binary. Everything is driven through `just` — recipes are OS-gated via `[macos]`/`[linux]`/`[windows]` attributes, so the same command works everywhere:
-```
-just deps      # one-time: submodules, CEF download, macOS brew packages
-just build     # build + stage a runnable tree in build/ (+ .app bundle on macOS)
-just test      # run the workspace test suite (depends on build)
-just run       # run with debug logging → logs to build/run.log
-just run-mpv   # run the bundled mpv CLI directly (mpv-only debugging)
-just clean     # remove build/ and dist/, cargo clean
-just fmt        # format the workspace (cargo fmt)
-just fmt-check  # check formatting without writing
-just clippy     # clippy with -D warnings + unwrap/expect/panic denies
-just lint       # fmt-check + clippy
-just strict-lint # lint + clippy pedantic/nursery
-just appimage build # [linux] build AppImage
-just flatpak build  # [linux] build Flatpak bundle
-just dmg            # [macos] build Apple Disk Image (.dmg)
-```
-Platform-specific entry points live in `dev/linux/`, `dev/macos/`, `dev/windows/`, imported by the top-level justfile.
+This checkout is John's Hausflix port onto Jellium Desktop (upstream
+`andrewrabert/jellium-desktop` main at `ec4cba200498`, CEF 154). The app is
+still called **Hausflix Desktop**; the binary keeps upstream's name
+`jellium-desktop`.
 
-## Before Committing
-Run `just fmt` and `just lint` before every commit; both must pass clean (lint runs `fmt-check` + `clippy`, and CI rejects unformatted or lint-failing code).
+## Where Windows builds come from (read this before any Windows build)
 
-## Architecture
-- **CEF** (Chromium Embedded Framework) — hosts jellyfin-web as an embedded browser; handles JS-to-Rust IPC for player control commands and renders the UI as an overlay texture above the video layer. Multi-process: browser process (main app, owns CefBrowser), renderer process (V8/Blink), GPU process. IPC via `CefProcessMessage`. Bindings via `cef-dll-sys`; project glue lives in `src/jfn_cef`.
-- **mpv** (fork in `third_party/mpv`) — video playback; the desktop client injects native shims to override browser media playback. mpv owns its own window + GPU; libmpv is used only for the control plane (properties/commands/events).
-- Wayland subsurface for video layer (Linux). Platform crates: `src/macos`, `src/windows`, plus Wayland/X11 paths under `src/`.
+- Build from branch **`integration/jellium-2026-11-09`** of this repo
+  (`/Volumes/Storage/source/hausflix-jellium-integration-2026-11-09` on the Mac).
+- Do **not** build from `feature/hausflix-windows-personal`. That is the
+  pre-Jellium branch (old CEF and old Windows compositor) and is superseded.
+- This branch has **not been pushed to GitHub yet**. `origin` here is a local
+  comparison repo, so a Windows machine can't fetch it until John pushes it to
+  `hausmanj/jellyfin-desktop`. John decides when that happens.
+- The mpv submodule must stay at **`1ea4b4cf5`**, which is the custom CoreAudio
+  passthrough fix. That commit is on `github.com/hausmanj/mpv`. `.gitmodules`
+  still points at `andrewrabert/mpv`, whose pinned `ab0467ff24` does **not**
+  include the fix. Check `git ls-files -s third_party/mpv` after any submodule
+  update.
+- On Windows, use upstream's recipes: `just deps`, then `just build`
+  (`dev/windows/build.ps1`, plus `dev/windows/build_mpv_source.ps1` for mpv).
+- As of 2026-11-09, Windows has only been cross-compile checked from the Mac
+  (`cargo-xwin check` and `clippy`). No real Windows exe has been built or
+  tested yet: no DV, HDR10/SDR, VO recreation, TV hotplug or RDP testing.
+- John's GitHub PRs against upstream will probably need updating once this
+  build has been tested. Don't touch them without his OK.
 
-## mpv Integration
-- **Never call sync mpv API (`mpv_get_property`, etc.) from event callbacks** - causes deadlock during video init. Use property observation or async variants instead.
+## Data compatibility
 
-## mpv Event Flow
-mpv is the authoritative source of playback state. All state (position, speed, pause, seeking, etc.) flows from mpv property observations outward to the JS UI and OS media sessions. The JS UI and MPRIS/macOS media sessions are consumers — they never determine playback state, they only reflect what mpv reports. This means things like rate changes, seek completion, and position updates come from mpv, not from JS round-trips or manual bookkeeping.
+Config and cache directories are still named `jellyfin-desktop`, so existing
+settings, profiles and logins carry over:
 
-## Debugging
-- For mpv (third_party/mpv), jellyfin-web, and CEF: investigate source code directly before suggesting debug logs that require manual user action
+| Platform | Config | Cache (CEF cache) |
+|---|---|---|
+| macOS | `~/.config/jellyfin-desktop` | `~/Library/Caches/jellyfin-desktop` |
+| Windows | `%APPDATA%\jellyfin-desktop` | `%LOCALAPPDATA%\jellyfin-desktop` |
+
+Don't adopt upstream's `jellium-desktop` directory names without a migration.
+
+## Ported Hausflix features
+
+- Profile picker / multi-user: `src/web/user-switch.js`
+- Startup window mode: `src/config`, plus the native settings in `src/jfn_rust/src/shell/settings.rs`
+- DV handling: `resources/mpv/scripts/dv-detect.lua`, plus the Windows VO rebind in `src/windows`
+- macOS audio passthrough: the mpv submodule commit above
+- Branding
+
+Regression tests live in `dev/tests/` and are run from the repo root:
+`node --test dev/tests/user-switch.cjs` and `luajit dev/tests/dv-detect.lua`.

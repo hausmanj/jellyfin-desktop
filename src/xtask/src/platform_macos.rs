@@ -27,7 +27,7 @@ pub fn stage_cef(out: &Path, cef: &cef::Cef) -> Result<()> {
         fw_dst.join(FRAMEWORK_NAME).as_os_str(),
     ])?;
     let old = format!("@executable_path/../Frameworks/{FRAMEWORK_NAME}.framework/{FRAMEWORK_NAME}");
-    let bin = out.join("jellyfin-desktop");
+    let bin = out.join("jellium-desktop");
     run_install_name_tool(&[
         "-change".as_ref(),
         old.as_ref(),
@@ -38,6 +38,10 @@ pub fn stage_cef(out: &Path, cef: &cef::Cef) -> Result<()> {
     for lib in ["libEGL.dylib", "libGLESv2.dylib"] {
         let dst = out.join(lib);
         let _ = std::fs::remove_file(&dst);
+        // CEF 154 no longer includes these optional ANGLE libraries.
+        if !fw_dst.join("Libraries").join(lib).exists() {
+            continue;
+        }
         let target = format!("Frameworks/{FRAMEWORK_NAME}.framework/Libraries/{lib}");
         std::os::unix::fs::symlink(&target, &dst)
             .with_context(|| format!("symlink {} -> {}", dst.display(), target))?;
@@ -86,8 +90,8 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
     std::fs::create_dir_all(&resources_dir)?;
 
     // Binary + staged libmpv
-    let bin_src = build_dir.join("jellyfin-desktop");
-    let bin_dst = macos_dir.join("jellyfin-desktop");
+    let bin_src = build_dir.join("jellium-desktop");
+    let bin_dst = macos_dir.join("jellium-desktop");
     xfs::copy_executable(&bin_src, &bin_dst)?;
     xfs::copy_file(
         &build_dir.join("libmpv.2.dylib"),
@@ -109,6 +113,10 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
     for lib in ["libEGL.dylib", "libGLESv2.dylib"] {
         let dst = macos_dir.join(lib);
         let _ = std::fs::remove_file(&dst);
+        // CEF 154 no longer includes these optional ANGLE libraries.
+        if !fw_dst.join("Libraries").join(lib).exists() {
+            continue;
+        }
         let target = format!("../Frameworks/{FRAMEWORK_NAME}.framework/Libraries/{lib}");
         std::os::unix::fs::symlink(&target, &dst)
             .with_context(|| format!("symlink {} -> {}", dst.display(), target))?;

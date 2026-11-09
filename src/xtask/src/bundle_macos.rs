@@ -50,7 +50,7 @@ pub fn complete(app: &Path) -> Result<()> {
         );
         println!("Fixing CEF framework paths...");
         install_name_tool(&["-id", &new, &cef_fw_lib.to_string_lossy()])?;
-        let bin = macos_dir.join("jellyfin-desktop");
+        let bin = macos_dir.join("jellium-desktop");
         install_name_tool(&["-change", &old, &new, &bin.to_string_lossy()])?;
     } else {
         eprintln!(
@@ -78,7 +78,7 @@ pub fn complete(app: &Path) -> Result<()> {
             queue.push(p);
         }
     }
-    queue.push(macos_dir.join("jellyfin-desktop"));
+    queue.push(macos_dir.join("jellium-desktop"));
 
     let mut iter = 0;
     while !queue.is_empty() {
@@ -116,7 +116,10 @@ pub fn complete(app: &Path) -> Result<()> {
     codesign(app, &fw_dir, &macos_dir, &entitlements)?;
 
     // Strip quarantine.
-    let _ = Command::new("xattr").args(["-cr"]).arg(app).status();
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-cr"])
+        .arg(app)
+        .status();
 
     println!("Bundle complete: {}", app.display());
     Ok(())
@@ -330,7 +333,7 @@ fn codesign(app: &Path, fw_dir: &Path, macos_dir: &Path, entitlements: &Path) ->
     }
 
     println!("  Signing executable with entitlements");
-    sign(&macos_dir.join("jellyfin-desktop"), Some(entitlements))?;
+    sign(&macos_dir.join("jellium-desktop"), Some(entitlements))?;
 
     println!("  Signing app bundle");
     sign(app, Some(entitlements))?;
