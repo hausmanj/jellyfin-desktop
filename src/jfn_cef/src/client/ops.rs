@@ -28,11 +28,6 @@ impl Inner {
     }
 
     pub(crate) fn set_focus(&self, focus: bool) {
-        jfn_logging::log(
-            jfn_logging::Category::Cef,
-            jfn_logging::Level::Info,
-            &format!("[dropdown] host set_focus={focus}"),
-        );
         if let Some(host) = self.host() {
             host.set_focus(if focus { 1 } else { 0 });
         }
@@ -78,13 +73,6 @@ impl Inner {
         let Some(host) = self.host() else {
             return;
         };
-        jfn_logging::log(
-            jfn_logging::Category::Cef,
-            jfn_logging::Level::Info,
-            &format!(
-                "[dropdown] mouse click at=({x}, {y}) button={button} up={mouse_up} count={click_count}"
-            ),
-        );
         let me = MouseEvent { x, y, modifiers };
         let raw_btn: sys::cef_mouse_button_type_t = unsafe { std::mem::transmute(button as u32) };
         host.send_mouse_click_event(
@@ -99,13 +87,6 @@ impl Inner {
         let Some(host) = self.host() else {
             return;
         };
-        if leave {
-            jfn_logging::log(
-                jfn_logging::Category::Cef,
-                jfn_logging::Level::Info,
-                &format!("[dropdown] mouse leave at=({x}, {y})"),
-            );
-        }
         let me = MouseEvent { x, y, modifiers };
         host.send_mouse_move_event(Some(&me), if leave { 1 } else { 0 });
     }

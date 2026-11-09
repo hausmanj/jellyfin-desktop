@@ -27,14 +27,6 @@ const VK_ESCAPE: i32 = 0x1B;
 const VK_UP: i32 = 0x26;
 const VK_DOWN: i32 = 0x28;
 
-fn trace(msg: &str) {
-    jfn_logging::log(
-        jfn_logging::Category::Cef,
-        jfn_logging::Level::Info,
-        &format!("[dropdown] {msg}"),
-    );
-}
-
 impl Inner {
     pub(super) fn dropdown(&self) -> MenuDelivery<'_> {
         self.surface()
@@ -51,7 +43,6 @@ impl Inner {
     }
 
     pub(crate) fn on_popup_show(&self, show: bool) {
-        trace(&format!("on_popup_show show={show}"));
         {
             let mut p = self.popup.lock();
             p.visible = show;
@@ -61,22 +52,10 @@ impl Inner {
             self.hide_dropdown();
             return;
         }
-        // Capture the focused <select> now, while focus is still on it.
-        // By the time the NSMenu dismisses and we run the commit JS, the
-        // active element will have drifted to body or the window.
-        self.exec_js(
-            "window.__jfnActiveSelect = \
-             (document.activeElement && document.activeElement.tagName === 'SELECT') \
-             ? document.activeElement : null; \
-             console.log('[dropdown] captured ' + (window.__jfnActiveSelect \
-             ? 'SELECT#' + window.__jfnActiveSelect.id \
-             : 'none, active=' + (document.activeElement && document.activeElement.tagName)));",
-        );
         self.send_process_message_named("getPopupOptions");
     }
 
     pub(crate) fn on_popup_size(self: &Arc<Self>, x: i32, y: i32, w: i32, h: i32) {
-        trace(&format!("on_popup_size x={x} y={y} w={w} h={h}"));
         {
             let mut p = self.popup.lock();
             p.x = x;
@@ -95,11 +74,6 @@ impl Inner {
         selectable: Vec<i32>,
         anchor: Option<(i32, i32)>,
     ) {
-        trace(&format!(
-            "options n={} selected={selected} selectable={} anchor={anchor:?}",
-            opts.len(),
-            selectable.len()
-        ));
         {
             let mut p = self.popup.lock();
             p.options = opts;
@@ -115,10 +89,6 @@ impl Inner {
         let (x, y, w, h, opts, selected, selectable) = {
             let p = self.popup.lock();
             if !p.visible || !p.size_received || !p.options_received {
-                trace(&format!(
-                    "try_show waiting visible={} size={} options={}",
-                    p.visible, p.size_received, p.options_received
-                ));
                 return;
             }
             // Blink's popup rect (p.x/p.y) flips above the element near the
@@ -137,23 +107,12 @@ impl Inner {
 
         let inner = Arc::clone(self);
         let on_selected = MenuSelection::new(move |idx| {
-            trace(&format!("menu resolved idx={idx}"));
             let authority = Arc::clone(&inner.session);
-            let admitted = authority.dispatch(|| {
+            authority.dispatch(|| {
                 let mut task = DispatchPopupTask::new(inner, idx, selected, selectable.clone());
-                post_task(ThreadId::UI, Some(&mut task))
+                let _ = post_task(ThreadId::UI, Some(&mut task));
             });
-            trace(&format!("menu resolved post_task={admitted:?}"));
         });
-        let delivery = match self.dropdown() {
-            MenuDelivery::Host(_) => "host",
-            MenuDelivery::Composited => "composited",
-            MenuDelivery::Page => "page",
-        };
-        trace(&format!(
-            "open delivery={delivery} n={} selected={selected} at=({x}, {y}) w={w}",
-            opts.len()
-        ));
         match self.dropdown() {
             MenuDelivery::Host(host) => host.open(MenuRequest {
                 items: options_as_items(&opts),
@@ -177,7 +136,6 @@ impl Inner {
     }
 
     pub(crate) fn on_deactivated(&self) {
-        trace("on_deactivated");
         let was_visible = {
             let mut p = self.popup.lock();
             let was = p.visible;
@@ -204,37 +162,14 @@ impl Inner {
     // ourselves, then replay the user's pick into CEF's still-open popup —
     // arrow-key to the chosen row + Enter to commit, or Escape to cancel.
     fn dispatch_popup_selection(&self, idx: i32, current: i32, selectable: &[i32]) {
+        // Blink already closed the popup: a replayed Escape or arrow would land
+        // on the page instead.
+        if !self.popup.lock().visible {
+            return;
+        }
         let Some(host) = self.host() else {
             return;
         };
-        // On macOS Blink dismisses its popup as soon as the NSMenu takes focus,
-        // so the key replay below never reaches it. Commit the pick directly
-        // on the <select> captured in on_popup_show first.
-        if idx >= 0 {
-            let js = format!(
-                "(function(){{var el=window.__jfnActiveSelect||document.activeElement;\
-                 window.__jfnActiveSelect=null;\
-                 console.log('[dropdown] commit idx={idx} target='+(el?el.tagName+'#'+el.id:'none')\
-                 +' current='+(el?el.selectedIndex:-1));\
-                 if(el&&el.tagName==='SELECT'&&el.selectedIndex!=={idx}){{\
-                 el.selectedIndex={idx};\
-                 el.dispatchEvent(new Event('input',{{bubbles:true}}));\
-                 el.dispatchEvent(new Event('change',{{bubbles:true}}));\
-                 }}}})()"
-            );
-            self.exec_js(&js);
-        }
-        // Blink already closed the popup: a replayed Escape or arrow would land
-        // on the page instead.
-        let visible = self.popup.lock().visible;
-        jfn_logging::log(
-            jfn_logging::Category::Cef,
-            jfn_logging::Level::Info,
-            &format!("dropdown pick idx={idx} popup_visible={visible}"),
-        );
-        if !visible {
-            return;
-        }
 
         let send_key = |code: i32| {
             let down = KeyEvent {
@@ -286,7 +221,6 @@ wrap_task! {
     }
     impl Task {
         fn execute(&self) {
-            trace(&format!("task execute idx={}", self.index));
             self.inner.session.dispatch(|| self.inner.dispatch_popup_selection(
                 self.index,
                 self.current,
