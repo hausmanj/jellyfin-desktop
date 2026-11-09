@@ -52,6 +52,14 @@ impl Inner {
             self.hide_dropdown();
             return;
         }
+        // Capture the focused <select> now, while focus is still on it.
+        // By the time the NSMenu dismisses and we run the commit JS, the
+        // active element will have drifted to body or the window.
+        self.exec_js(
+            "window.__jfnActiveSelect = \
+             (document.activeElement && document.activeElement.tagName === 'SELECT') \
+             ? document.activeElement : null;",
+        );
         self.send_process_message_named("getPopupOptions");
     }
 
@@ -162,14 +170,35 @@ impl Inner {
     // ourselves, then replay the user's pick into CEF's still-open popup —
     // arrow-key to the chosen row + Enter to commit, or Escape to cancel.
     fn dispatch_popup_selection(&self, idx: i32, current: i32, selectable: &[i32]) {
-        // Blink already closed the popup: a replayed Escape or arrow would land
-        // on the page instead.
-        if !self.popup.lock().visible {
-            return;
-        }
         let Some(host) = self.host() else {
             return;
         };
+        // On macOS Blink dismisses its popup as soon as the NSMenu takes focus,
+        // so the key replay below never reaches it. Commit the pick directly
+        // on the <select> captured in on_popup_show first.
+        if idx >= 0 {
+            let js = format!(
+                "(function(){{var el=window.__jfnActiveSelect||document.activeElement;\
+                 window.__jfnActiveSelect=null;\
+                 if(el&&el.tagName==='SELECT'&&el.selectedIndex!=={idx}){{\
+                 el.selectedIndex={idx};\
+                 el.dispatchEvent(new Event('input',{{bubbles:true}}));\
+                 el.dispatchEvent(new Event('change',{{bubbles:true}}));\
+                 }}}})()"
+            );
+            self.exec_js(&js);
+        }
+        // Blink already closed the popup: a replayed Escape or arrow would land
+        // on the page instead.
+        let visible = self.popup.lock().visible;
+        jfn_logging::log(
+            jfn_logging::Category::Cef,
+            jfn_logging::Level::Info,
+            &format!("dropdown pick idx={idx} popup_visible={visible}"),
+        );
+        if !visible {
+            return;
+        }
 
         let send_key = |code: i32| {
             let down = KeyEvent {
