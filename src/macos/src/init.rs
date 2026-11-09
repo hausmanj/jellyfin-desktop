@@ -294,10 +294,12 @@ define_class!(
         }
         #[unsafe(method(windowDidBecomeKey:))]
         unsafe fn window_did_become_key(&self, _n: *mut AnyObject) {
+            tracing::info!(target: "Platform", "[dropdown] window became key");
             jfn_input::jfn_input_dispatch_keyboard_focus(1);
         }
         #[unsafe(method(windowDidResignKey:))]
         unsafe fn window_did_resign_key(&self, _n: *mut AnyObject) {
+            tracing::info!(target: "Platform", "[dropdown] window resigned key");
             jfn_input::jfn_input_dispatch_keyboard_focus(0);
         }
         /// The window moved to a screen with a different backing scale.
