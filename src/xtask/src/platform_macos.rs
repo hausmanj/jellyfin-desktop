@@ -55,7 +55,10 @@ pub fn stage_mpv_scripts(out: &Path) -> Result<()> {
         .join("mpv")
         .join("scripts");
     if src.exists() {
-        xfs::copy_dir_recursive(&src, &out.join("mpv").join("scripts"))?;
+        let dst = out.join("mpv").join("scripts");
+        // Replace, not merge: a script removed from the repo must not linger.
+        let _ = std::fs::remove_dir_all(&dst);
+        xfs::copy_dir_recursive(&src, &dst)?;
     }
     Ok(())
 }
@@ -162,7 +165,10 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
         .join("mpv")
         .join("scripts");
     if scripts_src.exists() {
-        xfs::copy_dir_recursive(&scripts_src, &resources_dir.join("mpv").join("scripts"))?;
+        let dst = resources_dir.join("mpv").join("scripts");
+        // Replace, not merge: a script removed from the repo must not linger.
+        let _ = std::fs::remove_dir_all(&dst);
+        xfs::copy_dir_recursive(&scripts_src, &dst)?;
     }
 
     // Complete the bundle: dep-walk, install_name rewrites, codesign.

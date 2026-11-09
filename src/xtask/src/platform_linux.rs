@@ -18,7 +18,10 @@ pub fn stage_mpv_scripts(out: &Path) -> Result<()> {
         .join("mpv")
         .join("scripts");
     if src.exists() {
-        xfs::copy_dir_recursive(&src, &out.join("mpv").join("scripts"))?;
+        let dst = out.join("mpv").join("scripts");
+        // Replace, not merge: a script removed from the repo must not linger.
+        let _ = std::fs::remove_dir_all(&dst);
+        xfs::copy_dir_recursive(&src, &dst)?;
     }
     Ok(())
 }
@@ -58,7 +61,10 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
         .join("mpv")
         .join("scripts");
     if scripts_src.exists() {
-        xfs::copy_dir_recursive(&scripts_src, &prefix.join("mpv").join("scripts"))?;
+        let dst = prefix.join("mpv").join("scripts");
+        // Replace, not merge: a script removed from the repo must not linger.
+        let _ = std::fs::remove_dir_all(&dst);
+        xfs::copy_dir_recursive(&scripts_src, &dst)?;
     }
     Ok(prefix.to_path_buf())
 }
