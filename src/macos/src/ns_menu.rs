@@ -35,6 +35,7 @@ struct SelectionCb {
 impl SelectionCb {
     fn fire(&self, id: c_int) {
         let cb = self.fired.lock().take();
+        tracing::info!(target: "Platform", "[menu] fire id={id} pending={}", cb.is_some());
         if let Some(cb) = cb {
             cb.resolve(id);
         }
@@ -69,6 +70,15 @@ struct MenuRun {
 unsafe fn show_menu_on_main(run: MenuRun) {
     let window = jfn_macos_get_window();
     let input_view = jfn_macos_get_input_view();
+    tracing::info!(
+        target: "Platform",
+        "[menu] show entries={} at=({}, {}) window={} view={}",
+        run.spec.entries.len(),
+        run.spec.x,
+        run.spec.y,
+        !window.is_null(),
+        !input_view.is_null()
+    );
     if window.is_null() || input_view.is_null() {
         // Report cancel so callers don't hang waiting on a selection.
         run.cb.fire(-1);
@@ -127,7 +137,7 @@ unsafe fn show_menu_on_main(run: MenuRun) {
         x: run.spec.x as f64,
         y: run.spec.y as f64,
     };
-    let _: bool = unsafe {
+    let picked: bool = unsafe {
         msg_send![
             menu,
             popUpMenuPositioningItem: positioning_item,
@@ -136,6 +146,7 @@ unsafe fn show_menu_on_main(run: MenuRun) {
         ]
     };
 
+    tracing::info!(target: "Platform", "[menu] closed picked={picked}");
     // Modal call; if no item was picked the target hasn't fired yet —
     // report cancel.
     run.cb.fire(-1);
