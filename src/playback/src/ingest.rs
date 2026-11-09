@@ -176,8 +176,8 @@ fn end_file_input(reason: &jfn_mpv::EndFileReason) -> Input {
 /// within any such broad range but don't match any rate a real display
 /// actually uses.
 const KNOWN_REFRESH_RATES_HZ: &[f64] = &[
-    23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0, 50.0, 59.94, 60.0, 75.0, 90.0, 100.0, 119.88,
-    120.0, 144.0, 165.0, 180.0, 200.0, 240.0,
+    23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0, 50.0, 59.94, 60.0, 72.0, 75.0, 85.0, 90.0, 96.0,
+    100.0, 119.88, 120.0, 144.0, 165.0, 180.0, 200.0, 240.0,
 ];
 
 fn is_plausible_refresh_rate(fps: f64) -> bool {
@@ -437,6 +437,21 @@ mod tests {
                     &ctx(Scale::ONE)
                 )
                 .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn display_fps_accepts_72_85_96_hz() {
+        for hz in [72.0, 85.0, 96.0] {
+            let state = IngestState::new();
+            let out = ingest(
+                &prop(observe_id::DISPLAY_FPS, PropertyValue::Double(hz)),
+                &state,
+                &ctx(Scale::ONE),
+            );
+            assert!(
+                matches!(out.as_slice(), [IngestOut::Input(Input::DisplayHz(got))] if *got == hz)
             );
         }
     }
