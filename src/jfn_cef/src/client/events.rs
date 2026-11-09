@@ -58,7 +58,6 @@ impl Inner {
         );
         if is_main {
             self.note_main_frame_loaded(url);
-            jfn_input::sink::web_became_live();
         }
     }
 
