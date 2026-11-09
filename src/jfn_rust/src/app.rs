@@ -1346,14 +1346,7 @@ extern "C" fn h_browsers_set_refresh_rate(hz: f64) {
     };
     jfn_gpu_paint::report_refresh(jfn_gpu_paint::RefreshSource::MpvDisplayFps, rate);
     if let Some(overlay) = WEB_OVERLAY.lock().clone() {
-        // Preserve the personal branch's 10 Hz fullscreen UI cap without
-        // reporting it as the physical monitor's refresh rate.
-        let cef_rate = if jfn_playback::ingest_driver::jfn_playback_fullscreen() {
-            jfn_gpu_paint::RefreshRate::from_hz(10.0).unwrap_or(rate)
-        } else {
-            rate
-        };
-        overlay.set_refresh_rate(cef_rate);
+        overlay.set_refresh_rate(rate);
     }
 }
 extern "C" fn h_theme_set_titlebar(rgb: u32) {

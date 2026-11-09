@@ -90,9 +90,6 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
                 "window._nativeFullscreenChanged({})",
                 if snap.fullscreen { "true" } else { "false" }
             ));
-            if let Some(cb) = slot().lock().set_hz {
-                cb(snap.display_hz);
-            }
         }
         PlaybackEventKind::DisplayHzChanged => {
             if let Some(cb) = slot().lock().set_hz {
