@@ -9,19 +9,29 @@ still called **Hausflix Desktop**; the binary keeps upstream's name
 
 ## Where Windows builds come from (read this before any Windows build)
 
-- Build from branch **`integration/jellium-2026-11-09`** of this repo
-  (`/Volumes/Storage/source/hausflix-jellium-integration-2026-11-09` on the Mac).
+- Build from branch **`integration/jellium-2026-11-09`** on
+  `github.com/hausmanj/jellyfin-desktop`. On the Mac the checkout is
+  `/Volumes/Storage/source/hausflix-jellium-integration-2026-11-09`.
 - Do **not** build from `feature/hausflix-windows-personal`. That is the
   pre-Jellium branch (old CEF and old Windows compositor) and is superseded.
-- This branch has **not been pushed to GitHub yet**. `origin` here is a local
-  comparison repo, so a Windows machine can't fetch it until John pushes it to
-  `hausmanj/jellyfin-desktop`. John decides when that happens.
+- **Getting the updates on Windows (do this before every rebuild):**
+  ```
+  git fetch origin
+  git checkout integration/jellium-2026-11-09   # first time: git checkout -t origin/integration/jellium-2026-11-09
+  git pull --ff-only
+  git submodule sync
+  git submodule update --init --recursive
+  git ls-files -s third_party/mpv   # must print 80296818...
+  ```
+  Then `just deps` and `just build`. `submodule sync` matters: the mpv
+  submodule moved from `andrewrabert/mpv` to `hausmanj/mpv`, and an old clone
+  still has the old URL, so it can't fetch the custom commit.
 - The mpv submodule must stay at **`8029681`**: the custom CoreAudio
   passthrough fix (`1ea4b4cf5`) plus upstream mpv's two CoreAudio crash fixes
   (the ones behind upstream PRs #719/#742). It's on `github.com/hausmanj/mpv`,
-  branch `hausflix/jellium-2026-11-09`. `.gitmodules` still points at
-  `andrewrabert/mpv`, whose pinned `ab0467ff24` has **neither** change. Check
-  `git ls-files -s third_party/mpv` after any submodule update.
+  branch `hausflix/jellium-2026-11-09`, and `.gitmodules` points there.
+  Upstream's `andrewrabert/mpv` (pinned `ab0467ff24`) has **neither** change,
+  so never point the submodule back at it.
 - On Windows, use upstream's recipes: `just deps`, then `just build`
   (`dev/windows/build.ps1`, plus `dev/windows/build_mpv_source.ps1` for mpv).
 - As of 2026-11-09, Windows has only been cross-compile checked from the Mac
@@ -32,8 +42,19 @@ still called **Hausflix Desktop**; the binary keeps upstream's name
   method now used on macOS), #737 and #699 (Windows startup waits for mpv's
   window), #627 (PerMonitorV2 HiDPI and logical input coordinates; overlaps
   John's RDP scaling fixes).
-- John's GitHub PRs against upstream will probably need updating once this
-  build has been tested. Don't touch them without his OK.
+- **Test on Windows before PR #346 is updated.** This branch has the full
+  Dolby Vision handling: `dv-detect.lua`, plus the native VO-window rebind in
+  `src/windows/src/platform.rs` `win_on_window_handle_changed`, `input.rs`
+  `recreate_input_child_window` and `render::rebind`. That rebind was ported
+  onto upstream's new DirectComposition compositor on 2026-11-09 and has
+  never run on Windows. Test: DV -> HDR10 -> SDR, back-to-back DV files, DV ->
+  non-DV in fullscreen, and a looping theme video. Watch the log for
+  `mpv VO window replaced` and `input child window recreated`.
+- John's PRs (#346, #533, #580) were updated in place on 2026-11-09. The
+  full-DV update for #346 is committed but **held** on fork branch
+  `pr346-full-dv-pending` until the Windows test passes. When it does,
+  fast-forward `minimal-dv-fix` to that branch and push normally. Never
+  force-push, and don't touch the PRs without John's OK.
 
 ## Data compatibility
 
