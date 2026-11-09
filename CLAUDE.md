@@ -1,3 +1,20 @@
+# ⚠️ SUPERSEDED BRANCH: do not build Hausflix from here (2026-11-09)
+
+Hausflix Desktop was ported onto upstream Jellium Desktop (CEF 154, new
+Windows compositor). Windows builds now come from branch
+**`integration/jellium-2026-11-09`** on this same repo:
+
+```
+git fetch origin
+git checkout -t origin/integration/jellium-2026-11-09
+git submodule sync
+git submodule update --init --recursive
+```
+
+Read that branch's `CLAUDE.md` before building. It has the update steps,
+the required mpv commit and the Windows tests to run. This branch is kept
+only for history.
+
 # Project Notes
 
 ## Constraints
