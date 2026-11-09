@@ -1371,7 +1371,8 @@ extern "C" fn h_theme_set_mpv_bg(hex: *const c_char) {
     unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(hex) };
 }
 
-/// Owns the run_with_cef body — invoked once by `jfn_app_main`.
+/// Applies the configured startup window mode once, after the first page is
+/// on screen (or immediately when there is no server page to wait for).
 pub(crate) fn apply_startup_window_mode() {
     static APPLIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if APPLIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -1393,6 +1394,7 @@ pub(crate) fn apply_startup_window_mode() {
     }
 }
 
+/// Owns the run_with_cef body — invoked once by `jfn_app_main`.
 fn run_with_cef(
     boot: ReadyBoot,
     deferred: Option<BrowserCef>,
