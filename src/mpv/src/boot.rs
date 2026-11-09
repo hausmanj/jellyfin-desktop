@@ -257,8 +257,6 @@ fn apply_defaults(
     // while the main thread is blocked in init.
     set("force-window", "yes")?;
     set("idle", "yes")?;
-    // Explicit loading prevents duplicate DV writers in the user's scripts directory.
-    set("load-scripts", "no")?;
     load_bundled_scripts(handle)?;
 
     Ok(())

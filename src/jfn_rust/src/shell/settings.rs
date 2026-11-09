@@ -69,6 +69,7 @@ pub struct Settings {
     pub device_name_default: String,
     server_available: bool,
     decoration_options: Vec<Option<WindowDecorations>>,
+    startup_modes: Vec<jfn_config::StartupWindowMode>,
 }
 
 impl Default for Settings {
@@ -79,6 +80,8 @@ impl Default for Settings {
 
 impl Settings {
     pub fn new() -> Self {
+        let startup_modes =
+            startup_modes(jfn_platform_abi::try_lease().map(|lease| lease.platform().display()));
         let decoration_options = jfn_platform_abi::try_lease().map_or_else(Vec::new, |lease| {
             let platform = lease.platform();
             decoration_options(
@@ -92,6 +95,7 @@ impl Settings {
             device_name_default: jfn_config::default_device_name(),
             server_available: !jfn_config::server_url().is_empty(),
             decoration_options,
+            startup_modes,
         }
     }
 
@@ -158,11 +162,7 @@ impl Settings {
             controls::select(
                 STARTUP_MODE_CONTROL,
                 jfn_config::startup_window_mode(),
-                vec![
-                    jfn_config::StartupWindowMode::Windowed,
-                    jfn_config::StartupWindowMode::Maximized,
-                    jfn_config::StartupWindowMode::Fullscreen
-                ],
+                self.startup_modes.clone(),
                 |mode: &jfn_config::StartupWindowMode| match mode {
                     jfn_config::StartupWindowMode::Windowed => "Open windowed".to_owned(),
                     jfn_config::StartupWindowMode::Maximized => "Open maximized".to_owned(),
@@ -354,6 +354,7 @@ impl Settings {
             device_name_default: "host".to_owned(),
             server_available: false,
             decoration_options: Vec::new(),
+            startup_modes: startup_modes(None),
         }
     }
 
@@ -432,6 +433,16 @@ fn decoration_options(
     std::iter::once(None)
         .chain(options.into_iter().map(Some))
         .collect()
+}
+
+/// Maximized is not a distinct state on macOS (zoom) or Wayland, so it is
+/// offered only where the window manager has one.
+fn startup_modes(display: Option<DisplayBackend>) -> Vec<jfn_config::StartupWindowMode> {
+    use jfn_config::StartupWindowMode::{Fullscreen, Maximized, Windowed};
+    match display {
+        Some(DisplayBackend::MacOS | DisplayBackend::Wayland) => vec![Windowed, Fullscreen],
+        _ => vec![Windowed, Maximized, Fullscreen],
+    }
 }
 
 fn transparent_titlebar_visible(display: DisplayBackend) -> bool {
@@ -559,6 +570,18 @@ mod tests {
 
     #[test]
     fn transparent_titlebar_is_macos_only() {
+        assert!(
+            !startup_modes(Some(DisplayBackend::MacOS))
+                .contains(&jfn_config::StartupWindowMode::Maximized)
+        );
+        assert!(
+            !startup_modes(Some(DisplayBackend::Wayland))
+                .contains(&jfn_config::StartupWindowMode::Maximized)
+        );
+        assert!(
+            startup_modes(Some(DisplayBackend::Windows))
+                .contains(&jfn_config::StartupWindowMode::Maximized)
+        );
         assert!(transparent_titlebar_visible(DisplayBackend::MacOS));
         assert!(!transparent_titlebar_visible(DisplayBackend::Wayland));
         assert!(!transparent_titlebar_visible(DisplayBackend::X11));
