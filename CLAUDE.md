@@ -34,27 +34,23 @@ still called **Hausflix Desktop**; the binary keeps upstream's name
   so never point the submodule back at it.
 - On Windows, use upstream's recipes: `just deps`, then `just build`
   (`dev/windows/build.ps1`, plus `dev/windows/build_mpv_source.ps1` for mpv).
-- As of 2026-11-09, Windows has only been cross-compile checked from the Mac
-  (`cargo-xwin check` and `clippy`). No real Windows exe has been built or
-  tested yet: no DV, HDR10/SDR, VO recreation, TV hotplug or RDP testing.
-- Upstream Windows PRs to review for the Windows build (not applied here, as
-  of 2026-11-09): #738 (Windows `<select>` dropdowns as in-page menus, the same
-  method now used on macOS), #737 and #699 (Windows startup waits for mpv's
-  window), #627 (PerMonitorV2 HiDPI and logical input coordinates; overlaps
-  John's RDP scaling fixes).
-- **Test on Windows before PR #346 is updated.** This branch has the full
-  Dolby Vision handling: `dv-detect.lua`, plus the native VO-window rebind in
-  `src/windows/src/platform.rs` `win_on_window_handle_changed`, `input.rs`
-  `recreate_input_child_window` and `render::rebind`. That rebind was ported
-  onto upstream's new DirectComposition compositor on 2026-11-09 and has
-  never run on Windows. Test: DV -> HDR10 -> SDR, back-to-back DV files, DV ->
-  non-DV in fullscreen, and a looping theme video. Watch the log for
-  `mpv VO window replaced` and `input child window recreated`.
-- John's PRs (#346, #533, #580) were updated in place on 2026-11-09. The
-  full-DV update for #346 is committed but **held** on fork branch
-  `pr346-full-dv-pending` until the Windows test passes. When it does,
-  fast-forward `minimal-dv-fix` to that branch and push normally. Never
-  force-push, and don't touch the PRs without John's OK.
+- **Windows build status (2026-11-13):** Built and tested on real Windows
+  hardware (Basement PC `100.87.82.89`, AMD Radeon Graphics + LG OLED).
+  DirectComposition tier-1 fallback, composition target rebind retry/teardown,
+  sync `wait_for_hwnd` boot wait, and SMTC consumer thread join were verified
+  and committed.
+- Upstream Windows PRs reviewed: #737 / #699 startup window-wait resolved via
+  safe sync `window-id` property poll in `platform.rs`.
+- **PR Updates (2026-11-13):**
+  - **PR #346 (`minimal-dv-fix`):** Updated with full Dolby Vision presentation
+    profile selection (`dv-detect.lua`), VO window rebind, DComp tier-1
+    clipping fallback, retry race hardening, and SMTC consumer thread join.
+    Synced with upstream `main` (`96bae1c`).
+  - **PR #533 (`feature/startup-window-mode-upstream`):** Synced with upstream
+    `main` (`96bae1c`). Clean diff against upstream (6 files, +176, -4).
+  - **PR #580 (`feature/user-profile-switching`):** Synced with upstream
+    `main` (`96bae1c`). Clean diff against upstream (6 files, +1028, -5).
+  - All PR branches pushed cleanly via linear fast-forwards. Never force-push.
 
 ## Data compatibility
 
