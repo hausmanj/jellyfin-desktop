@@ -78,3 +78,46 @@ Don't adopt upstream's `jellium-desktop` directory names without a migration.
 
 Regression tests live in `dev/tests/` and are run from the repo root:
 `node --test dev/tests/user-switch.cjs` and `luajit dev/tests/dv-detect.lua`.
+
+## Windows Remote Access & Deployment Notes (2026-11-12)
+
+### Remote Access & SSH Setup
+- **Family Room Machine:** Hausflix Family Room (`DESKTOP-49H5SUT`, Windows 11 Pro 24H2 build 26100, AMD Radeon Graphics).
+  - **Tailscale IP:** `100.78.3.18`
+  - **SSH Command:** `ssh familyroom`
+- **Basement Machine:** Hausflix Basement (`DESKTOP-JUC0QAF`, Windows 11 build 26100).
+  - **Tailscale IP:** `100.87.82.89`
+  - **SSH Command:** `ssh basement` (user `johnhausman`)
+- **Bedroom Machine:** Hausflix Bedroom (`jellyfinbedroom`, Windows 11 build 26100).
+  - **Tailscale IP:** `100.92.211.3`
+  - **SSH Command:** `ssh bedroom` (user `john`)
+  *(Configured in `~/.ssh/config` with key `~/.ssh/id_ed25519`)*.
+- **Windows OpenSSH Configuration:**
+  - Mac public key authorized in both `%USERPROFILE%\.ssh\authorized_keys` and `%ProgramData%\ssh\administrators_authorized_keys` (with `icacls` restricted to `Administrators:F` and `SYSTEM:F`).
+  - `sshd` and `ssh-agent` services are set to Automatic.
+- **RDP Configuration (Windows App on Mac):**
+  - **Uncheck "Connect to an admin session"** in the Windows App connection settings; the admin session flag requests console takeover (Session 1), causing a 30-second delay/approval prompt.
+  - Enforced single session policy via registry: `HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services\fSingleSessionPerUser` = `1`.
+
+### Live Deployment & Runtime Findings
+- **Staging location:** `C:\Users\johnhausman\Desktop\buildtest4\build\jellium-desktop.exe`
+- **Shortcuts & Taskbar:**
+  - Start menu shortcut: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Jellium Desktop.lnk`
+  - Taskbar pinned: `%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Jellium.lnk` (registered in `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband`).
+  - Note on Windows 11 taskbar at low resolutions (e.g. 1024x768 RDP): pinned icons may overflow into the three-dot `...` taskbar overflow tray.
+- **Process Architecture (CEF Multi-Process):**
+  - A single app run produces 5–6 `jellium-desktop.exe` subprocesses in Task Manager:
+    1. Main Browser Process (owns UI, mpv, and window)
+    2. Chromium GPU Process (`--type=gpu-process`)
+    3. Chromium Renderer Process (`--type=renderer`)
+    4. Chromium Network & Audio Utility Services (`--type=utility`)
+  - All child processes are managed under a Windows Job Object and exit cleanly when the main process exits.
+- **Crash & Device-Lost Analysis:**
+  - **Symptoms:** Under prolonged playback / repeated runs, Windows hit virtual memory exhaustion (Event 2004), causing `dwm.exe` (Desktop Window Manager) to crash (`0xc00001ad` in `dwmcore.dll`).
+  - **Root Cause:** DWM crash/reset destroyed the DXGI swapchain / Direct3D 11 device (`0x8007000e`). `wgpu-29.0.4` failed to reconfigure the surface on device loss and panicked:
+    ```
+    PANIC: panicked at wgpu-29.0.4\src\backend\wgpu_core.rs:3934:26:
+    Error in Surface::get_current_texture_view: Validation Error
+    Caused by: Surface is not configured for presentation
+    ```
+  - **Future Fix Needed:** Add device-loss recovery / surface reconfiguration in `jfn_gpu_paint` when DWM resets or display topology changes (e.g. RDP connect/disconnect, monitor resolution changes).
