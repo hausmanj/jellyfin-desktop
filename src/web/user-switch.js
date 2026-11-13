@@ -123,7 +123,19 @@
         const server = activeServer(credentials);
         if (!server) return null;
 
-        const user = userFromStorage(server);
+        let user = userFromStorage(server);
+        // Also check window.ApiClient if userFromStorage missed the image tag
+        if ((!user || !user.PrimaryImageTag) && window.ApiClient) {
+            try {
+                const currentUser = typeof window.ApiClient.getCurrentUser === 'function'
+                    ? window.ApiClient.getCurrentUser()
+                    : null;
+                if (currentUser && currentUser.Id === server.UserId) {
+                    user = Object.assign({}, user || {}, currentUser);
+                }
+            } catch (err) { /* ignore */ }
+        }
+
         // Skip if we don't have a real display name — the fallback
         // "User XXXXXXXX" creates phantom entries that require re-login.
         if (!user?.Name && !server?.UserName) return null;
@@ -316,11 +328,38 @@
         return true;
     }
 
+    const AVATAR_COLORS = [
+        '#E50914', '#E5A00D', '#00A8E1', '#2ECC71',
+        '#9B59B6', '#1ABC9C', '#E67E22', '#3498DB',
+        '#E91E63', '#00BCD4'
+    ];
+
+    function avatarColor(name) {
+        let hash = 0;
+        const str = name || '';
+        for (let i = 0; i < str.length; i++) {
+            hash = (hash * 31 + str.charCodeAt(i)) & 0xffffff;
+        }
+        return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+    }
+
+    function avatarInitial(name) {
+        if (!name) return '?';
+        const trimmed = name.trim();
+        return trimmed ? trimmed.charAt(0).toUpperCase() : '?';
+    }
+
     function imageUrl(profile) {
         const base = profile.manualAddress || profile.localAddress || window.location.origin;
-        if (!profile.primaryImageTag || !base || !profile.id) return '';
-        return base.replace(/\/$/, '') + '/Users/' + profile.id + '/Images/Primary?tag=' +
-            encodeURIComponent(profile.primaryImageTag) + '&maxWidth=160';
+        if (!base || !profile.id) return '';
+        let url = base.replace(/\/$/, '') + '/Users/' + encodeURIComponent(profile.id) + '/Images/Primary?maxWidth=160';
+        if (profile.primaryImageTag) {
+            url += '&tag=' + encodeURIComponent(profile.primaryImageTag);
+        }
+        if (profile.accessToken) {
+            url += '&api_key=' + encodeURIComponent(profile.accessToken);
+        }
+        return url;
     }
 
     function removePicker() {
@@ -341,71 +380,152 @@
     }
 
     function buttonForProfile(profile, activeId) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.style.cssText = [
+        const card = document.createElement('div');
+        card.className = 'jfd-profile-card';
+        card.setAttribute('role', 'button');
+        card.setAttribute('tabindex', '0');
+        card.style.cssText = [
             'display:flex',
             'align-items:center',
             'gap:' + u(1),
             'width:100%',
-            'padding:' + u(1),
+            'padding:' + u(0.85) + ' ' + u(1),
             'border:' + PICKER_BORDER + ' solid rgba(255,255,255,.18)',
-            'border-radius:' + u(0.55),
+            'border-radius:' + u(0.65),
             'background:rgba(255,255,255,.07)',
             'color:#fff',
             'text-align:left',
-            'cursor:pointer'
+            'cursor:pointer',
+            'user-select:none',
+            'box-sizing:border-box',
+            'transition:background .15s ease, border-color .15s ease, transform .15s ease'
         ].join(';');
 
-        const img = document.createElement('div');
-        img.style.cssText = [
-            'width:' + u(3.3),
-            'height:' + u(3.3),
+        // Highlight full card on hover & focus
+        card.addEventListener('mouseenter', () => {
+            card.style.background = 'rgba(255,255,255,.15)';
+            card.style.borderColor = 'rgba(255,255,255,.45)';
+            card.style.transform = 'scale(1.015)';
+        });
+        card.addEventListener('mouseleave', () => {
+            card.style.background = 'rgba(255,255,255,.07)';
+            card.style.borderColor = 'rgba(255,255,255,.18)';
+            card.style.transform = 'scale(1)';
+        });
+        card.addEventListener('focus', () => {
+            card.style.background = 'rgba(255,255,255,.18)';
+            card.style.borderColor = '#00a4dc';
+            card.style.outline = 'none';
+        });
+        card.addEventListener('blur', () => {
+            card.style.background = 'rgba(255,255,255,.07)';
+            card.style.borderColor = 'rgba(255,255,255,.18)';
+        });
+
+        // Avatar container with user initial and deterministic color
+        const avatar = document.createElement('div');
+        avatar.style.cssText = [
+            'width:' + u(3.5),
+            'height:' + u(3.5),
             'border-radius:50%',
-            'background:#333',
-            'background-size:cover',
-            'background-position:center',
-            'flex:0 0 auto'
+            'background:' + avatarColor(profile.name),
+            'display:flex',
+            'align-items:center',
+            'justify-content:center',
+            'font-size:' + u(1.5),
+            'font-weight:700',
+            'color:#ffffff',
+            'flex:0 0 auto',
+            'position:relative',
+            'overflow:hidden',
+            'box-shadow:0 ' + u(0.15) + ' ' + u(0.4) + ' rgba(0,0,0,.35)',
+            'pointer-events:none'
         ].join(';');
-        const url = imageUrl(profile);
-        if (url) img.style.backgroundImage = 'url("' + url.replace(/"/g, '%22') + '")';
-        btn.appendChild(img);
+        avatar.textContent = avatarInitial(profile.name);
 
+        const url = imageUrl(profile);
+        if (url) {
+            const img = document.createElement('img');
+            img.src = url;
+            img.alt = profile.name || '';
+            img.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block';
+            img.onerror = () => { img.remove(); };
+            avatar.appendChild(img);
+        }
+        card.appendChild(avatar);
+
+        // Label with name and server name
         const label = document.createElement('div');
-        label.style.flex = '1';
+        label.style.cssText = 'flex:1;min-width:0;pointer-events:none';
         const name = document.createElement('div');
         name.textContent = profile.name || 'Unknown user';
-        name.style.cssText = 'font-size:' + u(1.15) + ';font-weight:600';
+        name.style.cssText = 'font-size:' + u(1.15) + ';font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
         label.appendChild(name);
         if (profile.serverName) {
             const server = document.createElement('div');
             server.textContent = profile.serverName;
-            server.style.cssText = 'font-size:' + u(0.95) + ';opacity:.72;margin-top:' + u(0.15);
+            server.style.cssText = 'font-size:' + u(0.95) + ';opacity:.72;margin-top:' + u(0.15) + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
             label.appendChild(server);
         }
-        btn.appendChild(label);
+        card.appendChild(label);
 
         if (profile.id === activeId) {
             const badge = document.createElement('div');
             badge.textContent = 'Current';
-            badge.style.cssText = 'font-size:' + u(0.87) + ';opacity:.75';
-            btn.appendChild(badge);
+            badge.style.cssText = 'font-size:' + u(0.87) + ';opacity:.85;flex:0 0 auto;pointer-events:none;padding:' + u(0.25) + ' ' + u(0.55) + ';background:rgba(255,255,255,.12);border-radius:' + u(0.3);
+            card.appendChild(badge);
         } else {
             const del = document.createElement('button');
             del.type = 'button';
             del.textContent = '×';
             del.title = 'Remove profile';
-            del.style.cssText = 'background:transparent;border:0;color:#fff;opacity:.5;cursor:pointer;font-size:' + u(1.55) + ';padding:0 ' + u(0.3) + ';line-height:1;flex:0 0 auto';
+            del.className = 'jfd-profile-del';
+            del.style.cssText = [
+                'background:transparent',
+                'border:0',
+                'color:#fff',
+                'opacity:.5',
+                'cursor:pointer',
+                'font-size:' + u(1.6),
+                'padding:' + u(0.1) + ' ' + u(0.5),
+                'line-height:1',
+                'flex:0 0 auto',
+                'border-radius:' + u(0.3),
+                'transition:opacity .15s ease, background .15s ease'
+            ].join(';');
+            del.addEventListener('mouseenter', () => {
+                del.style.opacity = '1';
+                del.style.background = 'rgba(255,255,255,.15)';
+            });
+            del.addEventListener('mouseleave', () => {
+                del.style.opacity = '.5';
+                del.style.background = 'transparent';
+            });
             del.addEventListener('click', (event) => {
                 event.stopPropagation();
                 deleteProfile(profile);
                 showPicker();
             });
-            btn.appendChild(del);
+            card.appendChild(del);
         }
 
-        btn.addEventListener('click', () => switchToProfile(profile));
-        return btn;
+        // Clicking anywhere on the card selects the user
+        card.addEventListener('click', (event) => {
+            if (event.target && event.target.closest && event.target.closest('.jfd-profile-del')) {
+                return;
+            }
+            switchToProfile(profile);
+        });
+        card.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                if (event.target && event.target.closest && event.target.closest('.jfd-profile-del')) {
+                    return;
+                }
+                event.preventDefault();
+                switchToProfile(profile);
+            }
+        });
+        return card;
     }
 
     function showPicker() {

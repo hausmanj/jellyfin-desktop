@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>User Switch Picker Test</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 40px;
+      background: #181818;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .demo-controls {
+      background: #222;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 500px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+    h1 {
+      font-size: 24px;
+      margin-top: 0;
+    }
+    p {
+      color: #aaa;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .open-btn {
+      background: #00a4dc;
+      color: white;
+      border: 0;
+      padding: 12px 24px;
+      font-size: 16px;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 16px;
+      transition: background 0.15s ease;
+    }
+    .open-btn:hover {
+      background: #0088b8;
+    }
+    #eventLog {
+      margin-top: 20px;
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 13px;
+      color: #4ade80;
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="demo-controls">
+    <h1>Profile Picker Test Harness</h1>
+    <p>This test page runs the updated <code>user-switch.js</code> script with mock Jellyfin server data to test avatar generation and full-card click hitboxes.</p>
+    <button class="open-btn" onclick="openPicker()">Open "Who's watching?" Picker</button>
+    <div id="eventLog">Ready - Click button above or press 'O' to open picker.</div>
+  </div>
+
+  <script>
+    // 1. Seed realistic mock credentials & profiles into localStorage
+    const CREDENTIALS_KEY = 'jellyfin_credentials';
+    const STORE_KEY = 'jellyfin_desktop_user_profiles_v1';
+
+    const mockCredentials = {
+      Servers: [{
+        Id: "server-home",
+        Name: "Hausflix Home",
+        ManualAddress: window.location.origin,
+        UserId: "user-1",
+        UserName: "John",
+        AccessToken: "mock-token-john"
+      }]
+    };
+
+    const mockStore = {
+      version: 1,
+      servers: {
+        "server-home": {
+          id: "server-home",
+          name: "Hausflix Home",
+          manualAddress: window.location.origin,
+          users: {
+            "user-1": {
+              id: "user-1",
+              serverId: "server-home",
+              name: "John",
+              primaryImageTag: "", // Test initials avatar fallback for John
+              accessToken: "mock-token-john",
+              dateLastSeen: Date.now()
+            },
+            "user-2": {
+              id: "user-2",
+              serverId: "server-home",
+              name: "Sarah",
+              primaryImageTag: "",
+              accessToken: "mock-token-sarah",
+              dateLastSeen: Date.now() - 100000
+            },
+            "user-3": {
+              id: "user-3",
+              serverId: "server-home",
+              name: "Kids Room",
+              primaryImageTag: "",
+              accessToken: "mock-token-kids",
+              dateLastSeen: Date.now() - 200000
+            },
+            "user-4": {
+              id: "user-4",
+              serverId: "server-home",
+              name: "Guest",
+              primaryImageTag: "",
+              accessToken: "mock-token-guest",
+              dateLastSeen: Date.now() - 300000
+            }
+          }
+        }
+      }
+    };
+
+    localStorage.setItem(CREDENTIALS_KEY, JSON.stringify(mockCredentials));
+    localStorage.setItem(STORE_KEY, JSON.stringify(mockStore));
+  </script>
+
+  <!-- Load the updated script -->
+  <script src="../../src/web/user-switch.js"></script>
+
+  <script>
+    // Intercept switch calls for test demonstration
+    const origSwitch = window.jfdUserSwitch.switchToProfile;
+    window.jfdUserSwitch.switchToProfile = function(profile) {
+      const log = document.getElementById('eventLog');
+      log.textContent = `Switched to profile: ${profile.name} (${profile.id})`;
+      log.style.color = '#38bdf8';
+      // Close picker
+      const overlay = document.getElementById('jfdUserSwitchOverlay');
+      if (overlay) overlay.remove();
+      return true;
+    };
+
+    function openPicker() {
+      window.jfdUserSwitch.showPicker();
+      const log = document.getElementById('eventLog');
+      log.textContent = "Picker opened. Hover anywhere on a card and click to test!";
+      log.style.color = '#facc15';
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'o' || e.key === 'O') {
+        const overlay = document.getElementById('jfdUserSwitchOverlay');
+        if (!overlay) openPicker();
+      }
+    });
+
+    // Auto open on load for easy testing
+    window.addEventListener('DOMContentLoaded', () => {
+      setTimeout(openPicker, 200);
+    });
+  </script>
+</body>
+</html>
